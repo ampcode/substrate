@@ -38,6 +38,8 @@ func TestAgentPKIRendersEverySource(t *testing.T) {
 		env.Cfg.Manifest("kind"),
 		env.Cfg.Manifest("agentgateway"),
 		env.Cfg.Manifest("kind-agentgateway"),
+		env.Cfg.Manifest("aks"),
+		env.Cfg.Manifest("aks", "atelet"),
 		// Components the installer applies on their own.
 		env.Cfg.Manifest("pod-certificate-controller.yaml"),
 		env.Cfg.Manifest("postgres.yaml"),

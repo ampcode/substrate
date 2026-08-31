@@ -76,6 +76,9 @@ function usage() {
   echo "  --pki-delivery=projected|agent         How pods get certificates: projected kubelet volumes (GKE, kind; default)"
   echo "                                         or the podcert-agent sidecar, for clusters without the"
   echo "                                         certificates.k8s.io/v1beta1 API such as AKS and EKS"
+  echo "  --overlay=NAME                         Install from manifests/ate-install/NAME instead of the GKE base"
+  echo "                                         (aks: in-cluster S3 snapshot store, no GCP auth; implies --pki-delivery=agent"
+  echo "                                         unless set). Not combined with kind or --atenet-router=agentgateway"
   echo "  --podcert-workers-per-signer N         Concurrent workers per podcertificate-controller signer (default: 1)"
   echo "  --rollout-timeout DURATION             Per-workload readiness wait timeout, kubectl-style Go duration (default: 60s)"
   echo "  --otlp-endpoint URL                    Send all control plane telemetry to URL, not to the cluster default (see benchmarking/telemetry/README.md)"
@@ -196,6 +199,24 @@ pki_delivery() {
   esac
 }
 
+# install_overlay echoes the name of the alternative control plane overlay
+# (--overlay / ATE_INSTALL_OVERLAY), or nothing for the GKE base and kind.
+# An overlay is a directory manifests/ate-install/<name> holding the full
+# ate-system bundle plus <name>/atelet for the targeted atelet redeploy.
+install_overlay() {
+  local overlay="${ATE_INSTALL_OVERLAY:-}"
+  [[ -n "${overlay}" ]] || return 0
+  if [[ ! -f "manifests/ate-install/${overlay}/kustomization.yaml" || ! -f "manifests/ate-install/${overlay}/atelet/kustomization.yaml" ]]; then
+    echo "Error: --overlay ${overlay}: manifests/ate-install/${overlay}/{,atelet/}kustomization.yaml not found" >&2
+    exit 1
+  fi
+  if [[ "${ATE_INSTALL_KIND:-false}" == "true" || "$(atenet_router)" == "agentgateway" ]]; then
+    echo "Error: --overlay is not combined with kind or --atenet-router=agentgateway" >&2
+    exit 1
+  fi
+  echo "${overlay}"
+}
+
 # render_manifest renders a manifest source (a plain YAML file, a directory of
 # plain YAML, or a Kustomize overlay directory) under manifests/ate-install
 # with image references resolved. Under --pki-delivery=agent the agent-pki
@@ -270,7 +291,11 @@ render_ate_system_manifests() {
     return
   fi
 
-  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+  local overlay=""
+  overlay="$(install_overlay)"
+  if [[ -n "${overlay}" ]]; then
+    render_manifest "manifests/ate-install/${overlay}"
+  elif [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     # Build everything resolved with Kustomize for Kind
     render_manifest manifests/ate-install/kind
   else
@@ -354,7 +379,12 @@ apply_atenet_egress() {
 # the base file unconditionally would overwrite a kind cluster's ConfigMap with
 # the GKE endpoint and silently break telemetry for every component at once.
 apply_otel_config() {
-  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+  if [[ -n "$(install_overlay)" && -f "manifests/ate-install/$(install_overlay)/ate-otel-config.yaml" ]]; then
+    run_kubectl apply -f "manifests/ate-install/$(install_overlay)/ate-otel-config.yaml"
+  elif [[ -n "$(install_overlay)" ]]; then
+    # The overlay reuses the kind collector and its ConfigMap.
+    run_kubectl apply -f manifests/ate-install/kind/ate-otel-config.yaml
+  elif [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     run_kubectl apply -f manifests/ate-install/kind/ate-otel-config.yaml
   else
     run_kubectl apply -f manifests/ate-install/ate-otel-config.yaml
@@ -690,6 +720,21 @@ ensure_apiserver_prerequisites() {
   create_api_server_env_vars
   run_kubectl get configmap -n ate-system ate-api-authentication >/dev/null 2>&1 \
     || create_api_authentication_config
+  if [[ -n "$(install_overlay)" ]]; then
+    run_kubectl get secret -n ate-system rustfs-credentials >/dev/null 2>&1 \
+      || create_rustfs_credentials_secret
+  fi
+}
+
+# The in-cluster S3 store of the aks overlay and atelet share these keys
+# (manifests/ate-install/aks/rustfs.yaml, aks/atelet). Created once with random
+# values and never rewritten, like the other install secrets.
+create_rustfs_credentials_secret() {
+  log_step "create_rustfs_credentials_secret"
+  run_kubectl create secret generic -n ate-system rustfs-credentials \
+    --from-literal=access-key="$(openssl rand -hex 16)" \
+    --from-literal=secret-key="$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | run_kubectl apply -f -
 }
 
 # Redeploy only the ate-apiserver
@@ -721,7 +766,9 @@ deploy_atelet() {
   apply_otel_endpoint_override
 
   local manifest=""
-  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+  if [[ -n "$(install_overlay)" ]]; then
+    manifest=$(render_manifest "manifests/ate-install/$(install_overlay)/atelet")
+  elif [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     # Use Kustomize to build and resolve the atelet DaemonSet patch
     manifest=$(render_manifest manifests/ate-install/kind/atelet)
   else
@@ -930,7 +977,10 @@ wait_actortemplate_ready() {
 
 delete_ate_system() {
   log_step "delete_ate_system"
-  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+  if [[ -n "$(install_overlay)" ]]; then
+    kubectl kustomize "manifests/ate-install/$(install_overlay)" --load-restrictor LoadRestrictionsNone \
+      | run_kubectl delete --ignore-not-found -f -
+  elif [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     kubectl kustomize manifests/ate-install/kind --load-restrictor LoadRestrictionsNone \
       | run_kubectl delete --ignore-not-found -f -
   else
@@ -1031,6 +1081,14 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       fi
       ATE_ATENET_ROUTER="${prescan_args[$((i + 1))]}"
       ;;
+    --overlay=*) ATE_INSTALL_OVERLAY="${prescan_args[i]#*=}" ;;
+    --overlay)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --overlay requires a directory name under manifests/ate-install" >&2
+        exit 1
+      fi
+      ATE_INSTALL_OVERLAY="${prescan_args[$((i + 1))]}"
+      ;;
     --pki-delivery=*) ATE_PKI_DELIVERY="${prescan_args[i]#*=}" ;;
     --pki-delivery)
       if (( i + 1 >= ${#prescan_args[@]} )); then
@@ -1115,6 +1173,11 @@ case "${BENCHMARK_SANDBOX_CLASS}" in
 esac
 podcert_workers_per_signer >/dev/null
 rollout_timeout >/dev/null
+install_overlay >/dev/null
+# The aks overlay exists for clusters without certificates.k8s.io/v1beta1.
+if [[ "${ATE_INSTALL_OVERLAY:-}" == "aks" && -z "${ATE_PKI_DELIVERY:-}" ]]; then
+  ATE_PKI_DELIVERY=agent
+fi
 if [[ "$(pki_delivery)" == "agent" && "${ATE_EXPERIMENTAL_USE_SDSMINT:-false}" == "true" ]]; then
   echo "Error: --experimental-use-sdsmint still relies on projected podCertificate volumes and is not supported with --pki-delivery=agent" >&2
   exit 1
@@ -1145,6 +1208,8 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     # Captured in the pre-scan above; matched here only so the `*)` branch does
     # not reject it as an unknown option.
+    --overlay) shift ;;
+    --overlay=*) ;;
     --pki-delivery) shift ;;
     --pki-delivery=*) ;;
     --experimental-use-sdsmint) ;;
