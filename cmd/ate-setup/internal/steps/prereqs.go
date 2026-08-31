@@ -77,13 +77,6 @@ func (e *Env) EnsurePodCertificateCAs(ctx context.Context) error {
 	return nil
 }
 
-// WaitForPodCertificateTrustBundles blocks until the podcertificate controller
-// has published both identity bundles.
-func (e *Env) WaitForPodCertificateTrustBundles(ctx context.Context) error {
-	log.Infof("Waiting for podcertificate ClusterTrustBundles to be ready...")
-	return e.Kube.WaitClusterTrustBundles(ctx, trustBundleNames, e.Cfg.WaitTimeout(BootstrapTimeout))
-}
-
 // ensureSecret runs create when the named Secret is absent.
 func (e *Env) ensureSecret(ctx context.Context, namespace, name string, create func(context.Context) error) error {
 	exists, err := e.Kube.SecretExists(ctx, namespace, name)

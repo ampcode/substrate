@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
+	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kube"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kustomize"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
@@ -47,6 +48,11 @@ func (e *Env) SetupCSI(ctx context.Context) error {
 	if err := e.RequireKind("CSI setup"); err != nil {
 		return err
 	}
+	if e.AgentPKI() {
+		// The csi-hostpath-socat ghostunnel sidecar still mounts projected
+		// podCertificate and clusterTrustBundle volumes.
+		return fmt.Errorf("CSI setup is not supported with --pki-delivery=%s", config.PKIDeliveryAgent)
+	}
 	// Both drivers register themselves with a CSIDriverConfig, so the ate CRDs
 	// have to be in place even when CSI setup runs on its own rather than as
 	// part of deploy ate-system.
@@ -59,7 +65,7 @@ func (e *Env) SetupCSI(ctx context.Context) error {
 	if err := e.EnsurePodCertificateCAs(ctx); err != nil {
 		return err
 	}
-	if err := e.KoApply(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml")); err != nil {
+	if err := e.applyPodCertificateController(ctx); err != nil {
 		return err
 	}
 	if err := e.applyPodcertWorkersOverride(ctx); err != nil {

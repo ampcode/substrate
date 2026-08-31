@@ -49,18 +49,18 @@ func SystemOverlay(cfg *config.Config) string {
 // image references resolved.
 func (e *Env) renderSystemManifests(ctx context.Context) ([]byte, error) {
 	if overlay := SystemOverlay(e.Cfg); overlay != "" {
-		return e.KustomizeResolve(ctx, overlay)
+		return e.RenderManifest(ctx, e.Cfg.Path(overlay))
 	}
-	return e.KoResolve(ctx, e.Cfg.Manifest())
+	return e.RenderManifest(ctx, e.Cfg.Manifest())
 }
 
 // renderAtenetRouterManifest produces the atenet router manifest for the
 // selected dataplane.
 func (e *Env) renderAtenetRouterManifest(ctx context.Context) ([]byte, error) {
 	if e.Cfg.Router == config.RouterAgentgateway {
-		return e.KustomizeResolve(ctx, installDir+"/agentgateway-router")
+		return e.RenderManifest(ctx, e.Cfg.Manifest("agentgateway-router"))
 	}
-	return e.KoResolve(ctx, e.Cfg.Manifest("atenet-router.yaml"))
+	return e.RenderManifest(ctx, e.Cfg.Manifest("atenet-router.yaml"))
 }
 
 // atenetEgressManifestPath returns the egress manifest path based on configuration.
@@ -77,10 +77,13 @@ func (e *Env) renderAtenetEgressManifest(ctx context.Context) ([]byte, error) {
 		if e.Cfg.AdditionalEgressExtprocService != "" {
 			return nil, fmt.Errorf("--experimental-additional-egress-extproc-service requires --atenet-router=envoy")
 		}
-		return e.KustomizeResolve(ctx, installDir+"/agentgateway-egress")
+		return e.RenderManifest(ctx, e.Cfg.Manifest("agentgateway-egress"))
 	}
 
 	if e.Cfg.AdditionalEgressExtprocService != "" {
+		if e.AgentPKI() {
+			return nil, fmt.Errorf("--experimental-additional-egress-extproc-service is not supported with --pki-delivery=%s", config.PKIDeliveryAgent)
+		}
 		patched, err := e.patchAtenetEgressManifest()
 		if err != nil {
 			return nil, err
@@ -88,7 +91,7 @@ func (e *Env) renderAtenetEgressManifest(ctx context.Context) ([]byte, error) {
 		return e.KoResolveBytes(ctx, patched)
 	}
 
-	return e.KoResolve(ctx, e.atenetEgressManifestPath())
+	return e.RenderManifest(ctx, e.atenetEgressManifestPath())
 }
 
 func (e *Env) patchAtenetEgressManifest() ([]byte, error) {

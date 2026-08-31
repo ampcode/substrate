@@ -1,0 +1,664 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# agent-pki: run Substrate on clusters that do not serve the
+# certificates.k8s.io/v1beta1 API (PodCertificateRequest, ClusterTrustBundle),
+# such as AKS and EKS on Kubernetes 1.34-1.36.
+#
+# Every projected podCertificate / clusterTrustBundle volume becomes a tmpfs
+# emptyDir written by a podcert-agent native sidecar (initContainer with
+# restartPolicy: Always). The agent authenticates to podcertcontroller's issuer
+# API with a bound ServiceAccount token, which the API server attests through
+# TokenReview, so the certificates carry the same PodIdentity extension and the
+# same SPIFFE URIs as on GKE; nothing that verifies them changes. Trust bundles
+# arrive through the podcert-trust-bundles ConfigMap the controller maintains
+# in every namespace. Mount paths and file names are unchanged, so no consumer
+# is patched apart from turning on its ConfigMap-backed code path.
+#
+# Order matters when combined with the agentgateway component: list this one
+# after it, because agentgateway re-adds projected volumes that this component
+# must then replace.
+
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  # ---- podcertificate-controller: serve the issuer API, do not touch
+  # certificates.k8s.io.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: podcertificate-controller
+      namespace: podcertificate-controller-system
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --serve-pod-certificate-requests=false
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --serve-issuer-api=true
+
+  # ---- ate-api-server: servicedns (cert+trust), podidentity (cert+trust)
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ate-api-server
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-api-server
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: servicedns
+              $patch: delete
+            - name: podidentity
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ate-api-server
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-api-server
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: podcert-agent
+              restartPolicy: Always
+              image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+              args:
+              - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+              - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+              startupProbe:
+                exec:
+                  command:
+                  - /ko-app/podcert-agent
+                  - --check
+                  - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+                  - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+                periodSeconds: 1
+                failureThreshold: 300
+              volumeMounts:
+              - name: podcert-token
+                mountPath: /var/run/secrets/podcert.ate.dev
+                readOnly: true
+              - name: podcert-trust
+                mountPath: /run/podcert-trust
+                readOnly: true
+              - name: servicedns
+                mountPath: /out/servicedns
+              - name: podidentity
+                mountPath: /out/podidentity
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 16Mi
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: servicedns
+              emptyDir:
+                medium: Memory
+            - name: podidentity
+              emptyDir:
+                medium: Memory
+
+  # ---- ate-controller: podidentity (cert), servicedns-ca (trust).
+  # --pki-delivery=agent makes it emit the same sidecar into worker pods; the
+  # sidecar image reaches it through PODCERT_AGENT_IMAGE because ko only
+  # resolves scalars that begin with ko://, so it cannot be inlined in an arg.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ate-controller
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --pki-delivery=agent
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --egress-mitm-trust-sink=configmap
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: PODCERT_AGENT_IMAGE
+          value: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ate-controller
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-controller
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: podidentity
+              $patch: delete
+            - name: servicedns-ca
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ate-controller
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-controller
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: podcert-agent
+              restartPolicy: Always
+              image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+              args:
+              - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+              - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+              startupProbe:
+                exec:
+                  command:
+                  - /ko-app/podcert-agent
+                  - --check
+                  - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+                  - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+                periodSeconds: 1
+                failureThreshold: 300
+              volumeMounts:
+              - name: podcert-token
+                mountPath: /var/run/secrets/podcert.ate.dev
+                readOnly: true
+              - name: podcert-trust
+                mountPath: /run/podcert-trust
+                readOnly: true
+              - name: podidentity
+                mountPath: /out/podidentity
+              - name: servicedns-ca
+                mountPath: /out/servicedns-ca
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 16Mi
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: podidentity
+              emptyDir:
+                medium: Memory
+            - name: servicedns-ca
+              emptyDir:
+                medium: Memory
+
+  # ---- atelet: podidentity (cert+trust), servicedns-ca (trust).
+  # --egress-mitm-trust-source=configmap replaces its ClusterTrustBundle watch.
+  - target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: atelet
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --egress-mitm-trust-source=configmap
+  - target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: atelet
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: podidentity
+              $patch: delete
+            - name: servicedns-ca
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: atelet
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: podcert-agent
+              restartPolicy: Always
+              image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+              args:
+              - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+              - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+              startupProbe:
+                exec:
+                  command:
+                  - /ko-app/podcert-agent
+                  - --check
+                  - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+                  - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+                periodSeconds: 1
+                failureThreshold: 300
+              volumeMounts:
+              - name: podcert-token
+                mountPath: /var/run/secrets/podcert.ate.dev
+                readOnly: true
+              - name: podcert-trust
+                mountPath: /run/podcert-trust
+                readOnly: true
+              - name: podidentity
+                mountPath: /out/podidentity
+              - name: servicedns-ca
+                mountPath: /out/servicedns-ca
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 16Mi
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: podidentity
+              emptyDir:
+                medium: Memory
+            - name: servicedns-ca
+              emptyDir:
+                medium: Memory
+
+  # ---- atenet-router: servicedns (cert), podidentity (cert+trust),
+  # servicedns-ca (trust)
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: atenet-router
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: atenet-router
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: servicedns
+              $patch: delete
+            - name: podidentity
+              $patch: delete
+            - name: servicedns-ca
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: atenet-router
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: atenet-router
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: podcert-agent
+              restartPolicy: Always
+              image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+              args:
+              - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+              - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+              - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+              startupProbe:
+                exec:
+                  command:
+                  - /ko-app/podcert-agent
+                  - --check
+                  - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+                  - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+                  - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+                periodSeconds: 1
+                failureThreshold: 300
+              volumeMounts:
+              - name: podcert-token
+                mountPath: /var/run/secrets/podcert.ate.dev
+                readOnly: true
+              - name: podcert-trust
+                mountPath: /run/podcert-trust
+                readOnly: true
+              - name: servicedns
+                mountPath: /out/servicedns
+              - name: podidentity
+                mountPath: /out/podidentity
+              - name: servicedns-ca
+                mountPath: /out/servicedns-ca
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 16Mi
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: servicedns
+              emptyDir:
+                medium: Memory
+            - name: podidentity
+              emptyDir:
+                medium: Memory
+            - name: servicedns-ca
+              emptyDir:
+                medium: Memory
+
+  # ---- atenet-egress: servicedns (cert+trust), podidentity (cert+trust).
+  # servicedns-ca exists only in the agentgateway variant; deleting a volume
+  # that is absent is a no-op, and the extra emptyDir is harmless under envoy.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: atenet-egress
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: atenet-egress
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: servicedns
+              $patch: delete
+            - name: podidentity
+              $patch: delete
+            - name: servicedns-ca
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: atenet-egress
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: atenet-egress
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            initContainers:
+            - name: podcert-agent
+              restartPolicy: Always
+              image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+              args:
+              - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+              - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+              - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+              startupProbe:
+                exec:
+                  command:
+                  - /ko-app/podcert-agent
+                  - --check
+                  - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+                  - --cert=podidentity.podcert.ate.dev/identity=/out/podidentity
+                  - --trust=servicedns.podcert.ate.dev/identity=/out/servicedns-ca
+                periodSeconds: 1
+                failureThreshold: 300
+              volumeMounts:
+              - name: podcert-token
+                mountPath: /var/run/secrets/podcert.ate.dev
+                readOnly: true
+              - name: podcert-trust
+                mountPath: /run/podcert-trust
+                readOnly: true
+              - name: servicedns
+                mountPath: /out/servicedns
+              - name: podidentity
+                mountPath: /out/podidentity
+              - name: servicedns-ca
+                mountPath: /out/servicedns-ca
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 16Mi
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: servicedns
+              emptyDir:
+                medium: Memory
+            - name: podidentity
+              emptyDir:
+                medium: Memory
+            - name: servicedns-ca
+              emptyDir:
+                medium: Memory
+
+  # ---- postgres: servicedns (cert, 0640 for PostgreSQL), podidentity-ca
+  # (trust). The agent must be the first init container so tls-reloader,
+  # which hashes these files with `set -e`, finds them on its first pass.
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: postgres
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: servicedns
+              $patch: delete
+            - name: podidentity-ca
+              $patch: delete
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: postgres
+      namespace: ate-system
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            volumes:
+            - name: podcert-token
+              projected:
+                sources:
+                - serviceAccountToken:
+                    audience: podcert.ate.dev
+                    expirationSeconds: 3600
+                    path: token
+            - name: podcert-trust
+              configMap:
+                name: podcert-trust-bundles
+            - name: servicedns
+              emptyDir:
+                medium: Memory
+            - name: podidentity-ca
+              emptyDir:
+                medium: Memory
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: postgres
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/template/spec/initContainers/0
+        value:
+          name: podcert-agent
+          restartPolicy: Always
+          image: ko://github.com/agent-substrate/substrate/cmd/podcert-agent
+          args:
+          # root:postgres 0640 via the pod's fsGroup, the only shared mode
+          # PostgreSQL accepts for ssl_key_file.
+          - --file-mode=0640
+          - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+          - --trust=podidentity.podcert.ate.dev/identity=/out/podidentity-ca
+          startupProbe:
+            exec:
+              command:
+              - /ko-app/podcert-agent
+              - --check
+              - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
+              - --trust=podidentity.podcert.ate.dev/identity=/out/podidentity-ca
+            periodSeconds: 1
+            failureThreshold: 300
+          volumeMounts:
+          - name: podcert-token
+            mountPath: /var/run/secrets/podcert.ate.dev
+            readOnly: true
+          - name: podcert-trust
+            mountPath: /run/podcert-trust
+            readOnly: true
+          - name: servicedns
+            mountPath: /out/servicedns
+          - name: podidentity-ca
+            mountPath: /out/podidentity-ca
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi

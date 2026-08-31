@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/agent-substrate/substrate/internal/podcertapi"
 	"github.com/agent-substrate/substrate/internal/portforward"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -36,6 +37,7 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	authv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -44,7 +46,8 @@ import (
 )
 
 const (
-	apiServerName = "api.ate-system.svc"
+	apiServerName      = "api.ate-system.svc"
+	ateSystemNamespace = "ate-system"
 
 	// serviceDNSSignerName and liveBundleSelector mirror the
 	// clusterTrustBundle projected-volume sources that in-cluster clients
@@ -169,7 +172,7 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 
 	// TODO: Should we special-case a LoadBalancer "api" Service and dial its
 	// address directly instead of port-forwarding?
-	localPort, stopForward, err := portforward.ServicePortForward(ctx, config, clientset, "ate-system", "api", 443)
+	localPort, stopForward, err := portforward.ServicePortForward(ctx, config, clientset, ateSystemNamespace, "api", 443)
 	if err != nil {
 		return nil, err
 	}
@@ -209,10 +212,31 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}, nil
 }
 
+// serverTLSConfig builds the trust for the ateapi server certificate from the
+// live servicedns trust bundle. It reads ClusterTrustBundles where the cluster
+// serves certificates.k8s.io/v1beta1, and otherwise (agent PKI delivery on
+// AKS, EKS) the podcert-trust-bundles ConfigMap the podcertificate controller
+// maintains in ate-system.
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.Config, error) {
+	pool, err := serviceDNSTrustPool(ctx, clientset)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    pool,
+		ServerName: apiServerName,
+	}, nil
+}
+
+func serviceDNSTrustPool(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
 	ctbs, err := clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{
 		LabelSelector: liveBundleSelector,
 	})
+	if apierrors.IsNotFound(err) {
+		// The API is not served on this cluster.
+		return serviceDNSTrustPoolFromConfigMap(ctx, clientset)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to list ClusterTrustBundles: %w", err)
 	}
@@ -231,12 +255,24 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.
 	if !found {
 		return nil, fmt.Errorf("no live ClusterTrustBundle found for signer %q", serviceDNSSignerName)
 	}
+	return pool, nil
+}
 
-	return &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		RootCAs:    pool,
-		ServerName: apiServerName,
-	}, nil
+func serviceDNSTrustPoolFromConfigMap(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
+	cm, err := clientset.CoreV1().ConfigMaps(ateSystemNamespace).Get(ctx, podcertapi.TrustConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("the cluster does not serve certificates.k8s.io/v1beta1 ClusterTrustBundles and reading ConfigMap %s/%s failed: %w", ateSystemNamespace, podcertapi.TrustConfigMapName, err)
+	}
+	key := podcertapi.TrustKey(serviceDNSSignerName)
+	bundle, ok := cm.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("ConfigMap %s/%s has no %q key", ateSystemNamespace, podcertapi.TrustConfigMapName, key)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(bundle)) {
+		return nil, fmt.Errorf("ConfigMap %s/%s key %q contains no valid certificates", ateSystemNamespace, podcertapi.TrustConfigMapName, key)
+	}
+	return pool, nil
 }
 
 // bearerTokenDialOption attaches the configured token, or mints an ate-client

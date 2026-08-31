@@ -124,16 +124,6 @@ func (e *Env) Kustomize(overlay string) ([]byte, error) {
 	return kustomize.Build(e.Cfg.Path(overlay))
 }
 
-// KustomizeResolve renders an overlay and pipes it through ko, the
-// `kubectl kustomize ... | run_ko resolve -f -` pipeline.
-func (e *Env) KustomizeResolve(ctx context.Context, overlay string) ([]byte, error) {
-	built, err := e.Kustomize(overlay)
-	if err != nil {
-		return nil, err
-	}
-	return e.KoResolveBytes(ctx, built)
-}
-
 // EnsureAteSystemNamespace applies the ate-system namespace manifest and waits
 // for it to go Active. Every deploy path starts here so that RBAC, ConfigMaps,
 // and workloads have somewhere to land.

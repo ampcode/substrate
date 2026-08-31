@@ -34,6 +34,15 @@ const (
 	RouterEnvoy        = "envoy"
 	RouterAgentgateway = "agentgateway"
 
+	// PKIDeliveryProjected hands out certificates and trust bundles through
+	// projected podCertificate and clusterTrustBundle volumes
+	// (certificates.k8s.io/v1beta1, available on GKE and kind).
+	PKIDeliveryProjected = "projected"
+	// PKIDeliveryAgent replaces those volumes with the podcert-agent sidecar
+	// and the podcert-trust-bundles ConfigMaps, for clusters such as AKS and
+	// EKS that do not serve certificates.k8s.io/v1beta1.
+	PKIDeliveryAgent = "agent"
+
 	SandboxClassGvisor  = "gvisor"
 	SandboxClassMicrovm = "microvm"
 )
@@ -87,6 +96,9 @@ type Config struct {
 
 	// Router selects the atenet router dataplane.
 	Router string
+	// PKIDelivery selects how workloads receive certificates and trust
+	// bundles: PKIDeliveryProjected or PKIDeliveryAgent.
+	PKIDelivery string
 	// PostgresConnectionString is the apiserver's store connection string.
 	// Empty means use DefaultPostgresConnectionString.
 	PostgresConnectionString string
@@ -129,6 +141,7 @@ type Options struct {
 	Kubeconfig                     string
 	Context                        string
 	Router                         string
+	PKIDelivery                    string
 	RolloutTimeout                 string
 	PodcertWorkersPerSigner        int
 	ExperimentalUseSDSMint         bool
@@ -219,6 +232,7 @@ func Load(opts Options) (*Config, error) {
 	}
 
 	cfg.Router = firstNonEmpty(opts.Router, env["ATE_ATENET_ROUTER"], RouterEnvoy)
+	cfg.PKIDelivery = firstNonEmpty(opts.PKIDelivery, env["ATE_PKI_DELIVERY"], PKIDeliveryProjected)
 
 	if err := validate(cfg); err != nil {
 		return nil, err
@@ -241,6 +255,14 @@ func validate(cfg *Config) error {
 	case RouterEnvoy, RouterAgentgateway:
 	default:
 		return fmt.Errorf("atenet router must be %s or %s, got %q", RouterEnvoy, RouterAgentgateway, cfg.Router)
+	}
+	switch cfg.PKIDelivery {
+	case PKIDeliveryProjected, PKIDeliveryAgent:
+	default:
+		return fmt.Errorf("--pki-delivery must be %s or %s, got %q", PKIDeliveryProjected, PKIDeliveryAgent, cfg.PKIDelivery)
+	}
+	if cfg.PKIDelivery == PKIDeliveryAgent && cfg.ExperimentalUseSDSMint {
+		return fmt.Errorf("--experimental-use-sdsmint still relies on projected podCertificate volumes and is not supported with --pki-delivery=%s", PKIDeliveryAgent)
 	}
 	if cfg.PodcertWorkersPerSigner < 0 {
 		return fmt.Errorf("--podcert-workers-per-signer must be a positive integer, got %d", cfg.PodcertWorkersPerSigner)
@@ -382,6 +404,7 @@ func (c *Config) ScriptEnv() []string {
 	if c.AdditionalEgressExtprocService != "" {
 		merged["ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE"] = c.AdditionalEgressExtprocService
 	}
+	merged["ATE_PKI_DELIVERY"] = c.PKIDelivery
 
 	env := make([]string, 0, len(merged))
 	for k, v := range merged {

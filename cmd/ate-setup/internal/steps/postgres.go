@@ -37,7 +37,7 @@ func (e *Env) DeployPostgres(ctx context.Context) error {
 	// The StatefulSet's projected serving certificate is issued by this
 	// controller. Applying it here makes `deploy postgres` usable on a fresh
 	// cluster as well as after `deploy ate-system`.
-	if err := e.KoApply(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml")); err != nil {
+	if err := e.applyPodCertificateController(ctx); err != nil {
 		return err
 	}
 	if err := e.applyPodcertWorkersOverride(ctx); err != nil {
@@ -50,8 +50,24 @@ func (e *Env) DeployPostgres(ctx context.Context) error {
 		return err
 	}
 
-	if err := e.Kube.ApplyPath(ctx, e.Cfg.Manifest("postgres.yaml")); err != nil {
+	if err := e.applyPostgres(ctx); err != nil {
 		return err
 	}
 	return e.Kube.RolloutStatus(ctx, kube.KindStatefulSet, NamespaceAteSystem, "postgres", e.Cfg.RolloutTimeout)
+}
+
+// applyPostgres applies the store StatefulSet. postgres.yaml has no ko image
+// references of its own, so projected delivery applies it as-is; agent
+// delivery renders it through the agent-pki component, which adds the
+// podcert-agent sidecar and therefore needs ko to resolve that image.
+func (e *Env) applyPostgres(ctx context.Context) error {
+	path := e.Cfg.Manifest("postgres.yaml")
+	if !e.AgentPKI() {
+		return e.Kube.ApplyPath(ctx, path)
+	}
+	manifest, err := e.RenderManifest(ctx, path)
+	if err != nil {
+		return err
+	}
+	return e.Kube.ApplyBytes(ctx, manifest)
 }

@@ -70,6 +70,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Router != RouterEnvoy {
 		t.Errorf("Router = %q, want %q", cfg.Router, RouterEnvoy)
 	}
+	if cfg.PKIDelivery != PKIDeliveryProjected {
+		t.Errorf("PKIDelivery = %q, want %q", cfg.PKIDelivery, PKIDeliveryProjected)
+	}
 	if cfg.PostgresConnString() != DefaultPostgresConnectionString {
 		t.Errorf("PostgresConnString() = %q, want %q", cfg.PostgresConnString(), DefaultPostgresConnectionString)
 	}
@@ -81,14 +84,18 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadFlagsBeatEnvironment(t *testing.T) {
 	loadEnv(t)
 	t.Setenv("ATE_ATENET_ROUTER", RouterEnvoy)
+	t.Setenv("ATE_PKI_DELIVERY", PKIDeliveryProjected)
 	t.Setenv("ATE_INSTALL_ROLLOUT_TIMEOUT", "30s")
 
-	cfg, err := Load(Options{Router: RouterAgentgateway, RolloutTimeout: "120s"})
+	cfg, err := Load(Options{Router: RouterAgentgateway, PKIDelivery: PKIDeliveryAgent, RolloutTimeout: "120s"})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.Router != RouterAgentgateway {
 		t.Errorf("Router = %q, want %q", cfg.Router, RouterAgentgateway)
+	}
+	if cfg.PKIDelivery != PKIDeliveryAgent {
+		t.Errorf("PKIDelivery = %q, want %q", cfg.PKIDelivery, PKIDeliveryAgent)
 	}
 	if want := 120 * time.Second; cfg.RolloutTimeout != want {
 		t.Errorf("RolloutTimeout = %v, want %v", cfg.RolloutTimeout, want)
@@ -182,6 +189,8 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		opts Options
 	}{
 		{"router", Options{Router: "nginx"}},
+		{"pki delivery", Options{PKIDelivery: "csi"}},
+		{"sdsmint agent pki", Options{ExperimentalUseSDSMint: true, PKIDelivery: PKIDeliveryAgent}},
 		{"rollout timeout", Options{RolloutTimeout: "invalid"}},
 		{"podcert workers", Options{PodcertWorkersPerSigner: -1}},
 		{"extproc missing sdsmint", Options{AdditionalEgressExtprocService: "ate-system/extproc:50051"}},

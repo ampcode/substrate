@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/agent-substrate/substrate/internal/egressmitmtrust"
 	"github.com/agent-substrate/substrate/internal/localca"
 )
 
@@ -298,5 +299,73 @@ func TestEgressMITMTrustKeepsLastGoodBundleOnBadPool(t *testing.T) {
 				t.Errorf("trustBundle was rewritten from an unreadable pool:\n%s", ctb.Spec.TrustBundle)
 			}
 		})
+	}
+}
+
+// Agent PKI delivery: the same bundle lands in a ConfigMap, follows rotation,
+// and disappears with the pool. No ClusterTrustBundle is touched.
+func TestEgressMITMTrustConfigMapSink(t *testing.T) {
+	t.Parallel()
+	scheme := egressMITMScheme(t)
+	secret, pool := caPoolSecret(t, "mitm", "mitm-next")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	r := &EgressMITMTrustReconciler{Client: c, Sink: EgressMITMTrustSinkConfigMap}
+	reconcile := func() error {
+		_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: EgressMITMCAPoolRef()})
+		return err
+	}
+	getCM := func() (*corev1.ConfigMap, bool) {
+		cm := &corev1.ConfigMap{}
+		err := c.Get(context.Background(), egressMITMTrustConfigMapRef(), cm)
+		if k8errors.IsNotFound(err) {
+			return nil, false
+		}
+		if err != nil {
+			t.Fatalf("get ConfigMap: %v", err)
+		}
+		return cm, true
+	}
+
+	if err := reconcile(); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	cm, ok := getCM()
+	if !ok {
+		t.Fatal("no ConfigMap was created")
+	}
+	if got, want := cm.Data[egressmitmtrust.ConfigMapKey], rootPEM(t, pool); got != want {
+		t.Errorf("trust bundle =\n%s\nwant\n%s", got, want)
+	}
+	if cm.Labels["podcert.ate.dev/canarying"] != "live" {
+		t.Errorf("labels = %v, want the live canarying label", cm.Labels)
+	}
+	if _, ok := getTrustBundle(t, c); ok {
+		t.Error("a ClusterTrustBundle was created under the ConfigMap sink")
+	}
+
+	// Rotation propagates.
+	pool.CAs = pool.CAs[1:]
+	rotated := secretForPool(t, pool)
+	rotated.ResourceVersion = ""
+	if err := c.Update(context.Background(), rotated); err != nil {
+		t.Fatalf("update pool secret: %v", err)
+	}
+	if err := reconcile(); err != nil {
+		t.Fatalf("Reconcile after rotation: %v", err)
+	}
+	cm, _ = getCM()
+	if got, want := cm.Data[egressmitmtrust.ConfigMapKey], rootPEM(t, pool); got != want {
+		t.Errorf("after rotation trust bundle =\n%s\nwant\n%s", got, want)
+	}
+
+	// Pool gone: ConfigMap goes with it.
+	if err := c.Delete(context.Background(), rotated); err != nil {
+		t.Fatalf("delete pool secret: %v", err)
+	}
+	if err := reconcile(); err != nil {
+		t.Fatalf("Reconcile after deletion: %v", err)
+	}
+	if _, ok := getCM(); ok {
+		t.Error("the ConfigMap outlived its CA pool")
 	}
 }

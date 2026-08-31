@@ -17,6 +17,9 @@ __pycache__/
 # Generated scratch directory for benchmark automation
 /benchmarking/automation/scratch/
 
+# Throwaway kustomizations the installers write under --pki-delivery=agent
+/manifests/ate-install/.render-*/
+
 # Developers can store local stuff in dirs named __something
 __*
 

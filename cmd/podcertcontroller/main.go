@@ -23,17 +23,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/issuer"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podidentitysigner"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/servicednssigner"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/trustpublisher"
 	"github.com/agent-substrate/substrate/internal/localca"
 	"github.com/agent-substrate/substrate/internal/version"
 	"github.com/spf13/pflag"
@@ -78,6 +83,43 @@ var (
 		"workers-per-signer",
 		1,
 		"Number of concurrent worker goroutines per signer.",
+	)
+
+	// Delivery modes. The projected mode uses the certificates.k8s.io
+	// PodCertificateRequest and ClusterTrustBundle APIs (beta in 1.34-1.36;
+	// enabled on GKE and kind). The agent mode serves the same certificates
+	// over HTTPS to podcert-agent sidecars and publishes trust bundles as
+	// ConfigMaps, for clusters (AKS, EKS) where those APIs are unavailable.
+	// Both may be on at once during a migration.
+	servePodCertificateRequests = pflag.Bool(
+		"serve-pod-certificate-requests",
+		true,
+		"Fulfill certificates.k8s.io PodCertificateRequests and publish ClusterTrustBundles. Disable on clusters without that API.",
+	)
+	serveIssuerAPI = pflag.Bool(
+		"serve-issuer-api",
+		false,
+		"Serve the podcert-agent issuer API and publish trust bundles as ConfigMaps in every namespace.",
+	)
+	issuerListenAddress = pflag.String(
+		"issuer-listen-address",
+		":8443",
+		"Address the issuer API listens on.",
+	)
+	issuerAudience = pflag.String(
+		"issuer-audience",
+		issuer.DefaultAudience,
+		"Bound ServiceAccount token audience the issuer API requires.",
+	)
+	issuerDNSNames = pflag.StringSlice(
+		"issuer-dns-name",
+		[]string{"podcert-issuer.podcertificate-controller-system.svc"},
+		"DNS names on the issuer API's serving certificate (signed by the "+servicednssigner.Name+" CA pool).",
+	)
+	trustConfigMapPeriod = pflag.Duration(
+		"trust-configmap-period",
+		30*time.Second,
+		"How often to reconcile the trust ConfigMaps in every namespace.",
 	)
 
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
@@ -126,14 +168,18 @@ func main() {
 	)
 	go hasher.Run(ctx)
 
+	if !*servePodCertificateRequests && !*serveIssuerAPI {
+		slog.ErrorContext(ctx, "At least one of --serve-pod-certificate-requests or --serve-issuer-api must be enabled")
+		os.Exit(1)
+	}
+
 	// Create a signer for servicedns.ate.dev/identity
 	serviceDNSCAPool, err := localca.NewRefreshingPool(*serviceDNSCAPoolFile)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error loading servicedns.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool, clock.RealClock{}), kc, hasher)
-	go serviceDNSSignerController.Run(ctx, *workersPerSigner)
+	serviceDNSSigner := servicednssigner.NewImpl(kc, serviceDNSCAPool, clock.RealClock{})
 
 	// Create a signer for podidentity.podcert.ate.dev/identity
 	podIdentityCAPool, err := localca.NewRefreshingPool(*podCAPoolFile)
@@ -141,10 +187,38 @@ func main() {
 		slog.ErrorContext(ctx, "Error loading podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(kc, podIdentityCAPool, clock.RealClock{}), kc, hasher)
-	go podIdentitySignerController.Run(ctx, *workersPerSigner)
+	podIdentitySigner := podidentitysigner.NewImpl(kc, podIdentityCAPool, clock.RealClock{})
 
 	// TODO: Reload when the file changes.
+
+	if *servePodCertificateRequests {
+		serviceDNSSignerController := signercontroller.New(clock.RealClock{}, serviceDNSSigner, kc, hasher)
+		go serviceDNSSignerController.Run(ctx, *workersPerSigner)
+
+		podIdentitySignerController := signercontroller.New(clock.RealClock{}, podIdentitySigner, kc, hasher)
+		go podIdentitySignerController.Run(ctx, *workersPerSigner)
+	}
+
+	if *serveIssuerAPI {
+		publisher := trustpublisher.New(kc, hasher, serviceDNSSigner, podIdentitySigner)
+		go publisher.Run(ctx, *trustConfigMapPeriod)
+
+		servingCert := issuer.NewServingCert(serviceDNSCAPool, *issuerDNSNames, 24*time.Hour, clock.RealClock{})
+		server := &http.Server{
+			Addr:              *issuerListenAddress,
+			Handler:           issuer.New(kc, *issuerAudience, serviceDNSSigner, podIdentitySigner).Handler(),
+			TLSConfig:         servingCert.TLSConfig(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			slog.InfoContext(ctx, "Serving issuer API", slog.String("addr", *issuerListenAddress), slog.Any("dnsNames", *issuerDNSNames))
+			// Certificate and key come from TLSConfig.GetCertificate.
+			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.ErrorContext(ctx, "Issuer API server failed", slog.Any("err", err))
+				os.Exit(1)
+			}
+		}()
+	}
 
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)

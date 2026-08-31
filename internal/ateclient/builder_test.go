@@ -30,9 +30,13 @@ import (
 	"time"
 
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestInitTracingDisabledReturnsNoProvider(t *testing.T) {
@@ -193,5 +197,40 @@ func TestServerTLSConfigErrors(t *testing.T) {
 				t.Error("serverTLSConfig: want error, got nil")
 			}
 		})
+	}
+}
+
+// On a cluster without certificates.k8s.io/v1beta1 the list returns NotFound
+// and the trust comes from the podcert-trust-bundles ConfigMap instead.
+func TestServerTLSConfigFallsBackToConfigMap(t *testing.T) {
+	servicednsCA := testCAPEM(t, "servicedns-ca")
+	clientset := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ate-system", Name: "podcert-trust-bundles"},
+		Data: map[string]string{
+			"servicedns.podcert.ate.dev-identity.pem":  string(servicednsCA),
+			"podidentity.podcert.ate.dev-identity.pem": string(testCAPEM(t, "podidentity-ca")),
+		},
+	})
+	clientset.PrependReactor("list", "clustertrustbundles", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "certificates.k8s.io", Resource: "clustertrustbundles"}, "")
+	})
+
+	cfg, err := serverTLSConfig(context.Background(), clientset)
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+	wantPool := x509.NewCertPool()
+	wantPool.AppendCertsFromPEM(servicednsCA)
+	if !cfg.RootCAs.Equal(wantPool) {
+		t.Error("RootCAs does not match the servicedns bundle from the ConfigMap")
+	}
+
+	// Neither source available: a clear error.
+	empty := fake.NewSimpleClientset()
+	empty.PrependReactor("list", "clustertrustbundles", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "certificates.k8s.io", Resource: "clustertrustbundles"}, "")
+	})
+	if _, err := serverTLSConfig(context.Background(), empty); err == nil {
+		t.Error("serverTLSConfig with no ClusterTrustBundle API and no ConfigMap: want error, got nil")
 	}
 }

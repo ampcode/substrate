@@ -15,10 +15,8 @@
 package servicednssigner
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"time"
 
@@ -30,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
-	"k8s.io/utils/ptr"
 )
 
 const Name = "servicedns.podcert.ate.dev/identity"
@@ -58,50 +55,32 @@ func (h *Impl) SignerName() string {
 	return Name
 }
 
-func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
-	name := CTBPrefix + "primary-bundle"
-
-	trustAnchors, err := h.caPool.TrustAnchors()
-	if err != nil {
-		return nil, fmt.Errorf("while retrieving CA pool trust anchors: %w", err)
-	}
-
-	wantTrustBundle := bytes.Buffer{}
-	for _, anchor := range trustAnchors {
-		block := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: anchor.Raw,
-		})
-		_, _ = wantTrustBundle.Write(block)
-	}
-
-	wantCTB := &certsv1beta1.ClusterTrustBundle{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"podcert.ate.dev/canarying": "live",
-			},
-		},
-		Spec: certsv1beta1.ClusterTrustBundleSpec{
-			SignerName:  Name,
-			TrustBundle: wantTrustBundle.String(),
-		},
-	}
-
-	return []*certsv1beta1.ClusterTrustBundle{
-		wantCTB,
-	}, nil
+// TrustBundlePEM returns the CA pool's trust anchors as PEM.
+func (h *Impl) TrustBundlePEM() (string, error) {
+	return signercontroller.TrustBundlePEM(h.caPool)
 }
 
+func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
+	return signercontroller.PrimaryClusterTrustBundle(Name, CTBPrefix, h.caPool)
+}
+
+// MakeCert fulfills a PodCertificateRequest: it issues the certificate and
+// writes it to the PCR status.
 func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
+	return signercontroller.FulfillPCR(ctx, h.kc, h.clock, h, pcr)
+}
+
+// Issue signs a serving certificate carrying the DNS names of every Service
+// that selects the attested pod.
+func (h *Impl) Issue(ctx context.Context, req *podcertificate.Request) (*podcertificate.Issued, error) {
 	// TODO: Switch from live reads to indexer
 
 	// If our signer had a policy about which pods are allowed to request
 	// certificates, it would be implemented here.
 
-	svcs, err := h.kc.CoreV1().Services(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{})
+	svcs, err := h.kc.CoreV1().Services(req.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("while listing services: %w", err)
+		return nil, fmt.Errorf("while listing services: %w", err)
 	}
 
 	// TODO: Looping over every service isn't great.  Maintain an index of pod
@@ -122,15 +101,15 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		}
 
 		// Find the set of pods that the service selects.
-		matchedPods, err := h.kc.CoreV1().Pods(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{
+		matchedPods, err := h.kc.CoreV1().Pods(req.Namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: svc.Spec.Selector}),
 		})
 		if err != nil {
-			return fmt.Errorf("while selecting pods for service %q: %w", pcr.ObjectMeta.Namespace+"/"+svc.ObjectMeta.Name, err)
+			return nil, fmt.Errorf("while selecting pods for service %q: %w", req.Namespace+"/"+svc.ObjectMeta.Name, err)
 		}
 
 		for _, matchedPod := range matchedPods.Items {
-			if matchedPod.ObjectMeta.Name == pcr.Spec.PodName && matchedPod.ObjectMeta.UID == pcr.Spec.PodUID {
+			if matchedPod.ObjectMeta.Name == req.PodName && matchedPod.ObjectMeta.UID == req.PodUID {
 				// TODO: I'm making some assumptions about the DNS names that
 				// resolve to a given Service.  I know at least one
 				// configuration that I suspect doesn't match these assumptions
@@ -147,25 +126,16 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 	// Without this, ate-apiserver can have a servicedns cert without DNS name
 	// while the covering Service is being created, and cache it for 24 hours.
 	if len(dnsNames) == 0 {
-		return fmt.Errorf("pod %s/%s is not (yet) selected by any Service; refusing to issue a serving cert with no DNS SANs", pcr.ObjectMeta.Namespace, pcr.Spec.PodName)
+		return nil, fmt.Errorf("pod %s/%s is not (yet) selected by any Service; refusing to issue a serving cert with no DNS SANs", req.Namespace, req.PodName)
 	}
 
 	// TODO: Encode the OIDC issuer of the cluster into the certificate.
 
-	subjectPublicKey, err := podcertificate.PublicKey(pcr)
-	if err != nil {
-		return err
-	}
-
 	// If our signer had an opinion on which key types were allowable, it would
-	// check subjectPublicKey, and deny the PCR with a SuggestedKeyType
+	// check the public key, and deny the request with a SuggestedKeyType
 	// condition on it.
 
-	lifetime := 24 * time.Hour
-	requestedLifetime := time.Duration(*pcr.Spec.MaxExpirationSeconds) * time.Second
-	if requestedLifetime < lifetime {
-		lifetime = requestedLifetime
-	}
+	lifetime := req.Lifetime(24 * time.Hour)
 
 	notBefore := h.clock.Now().Add(-2 * time.Minute)
 	notAfter := notBefore.Add(lifetime)
@@ -182,41 +152,20 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		// certificate.
 	}
 
-	chainDER, err := h.caPool.CreateCertificate(template, subjectPublicKey)
+	chainDER, err := h.caPool.CreateCertificate(template, req.PublicKey)
 	if err != nil {
-		return fmt.Errorf("while signing certificate: %w", err)
+		return nil, fmt.Errorf("while signing certificate: %w", err)
 	}
 
-	chainPEM := &bytes.Buffer{}
-	for _, certDER := range chainDER {
-		err = pem.Encode(chainPEM, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: certDER,
-		})
-		if err != nil {
-			return fmt.Errorf("while encoding certificate to PEM: %w", err)
-		}
-	}
-
-	pcr = pcr.DeepCopy()
-	pcr.Status.Conditions = []metav1.Condition{
-		{
-			Type:               certsv1beta1.PodCertificateRequestConditionTypeIssued,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Reason",
-			Message:            "Issued",
-			LastTransitionTime: metav1.NewTime(h.clock.Now()),
-		},
-	}
-	pcr.Status.CertificateChain = chainPEM.String()
-	pcr.Status.NotBefore = ptr.To(metav1.NewTime(notBefore))
-	pcr.Status.BeginRefreshAt = ptr.To(metav1.NewTime(beginRefreshAt))
-	pcr.Status.NotAfter = ptr.To(metav1.NewTime(notAfter))
-
-	_, err = h.kc.CertificatesV1beta1().PodCertificateRequests(pcr.ObjectMeta.Namespace).UpdateStatus(ctx, pcr, metav1.UpdateOptions{})
+	chainPEM, err := podcertificate.EncodeChainPEM(chainDER)
 	if err != nil {
-		return fmt.Errorf("while updating PodCertificateRequest: %w", err)
+		return nil, err
 	}
 
-	return nil
+	return &podcertificate.Issued{
+		ChainPEM:       chainPEM,
+		NotBefore:      notBefore,
+		BeginRefreshAt: beginRefreshAt,
+		NotAfter:       notAfter,
+	}, nil
 }

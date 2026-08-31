@@ -73,6 +73,9 @@ function usage() {
   echo "  --delete-ate-system                    Delete core system"
   echo "  --delete-all                           Delete core system and all registered demos"
   echo "  --atenet-router=envoy|agentgateway     Select the ingress and egress dataplane (default: envoy)"
+  echo "  --pki-delivery=projected|agent         How pods get certificates: projected kubelet volumes (GKE, kind; default)"
+  echo "                                         or the podcert-agent sidecar, for clusters without the"
+  echo "                                         certificates.k8s.io/v1beta1 API such as AKS and EKS"
   echo "  --podcert-workers-per-signer N         Concurrent workers per podcertificate-controller signer (default: 1)"
   echo "  --rollout-timeout DURATION             Per-workload readiness wait timeout, kubectl-style Go duration (default: 60s)"
   echo "  --otlp-endpoint URL                    Send all control plane telemetry to URL, not to the cluster default (see benchmarking/telemetry/README.md)"
@@ -181,6 +184,57 @@ atenet_router() {
   esac
 }
 
+pki_delivery() {
+  case "${ATE_PKI_DELIVERY:-projected}" in
+    projected|agent)
+      echo "${ATE_PKI_DELIVERY:-projected}"
+      ;;
+    *)
+      echo "Error: --pki-delivery must be projected or agent, got '${ATE_PKI_DELIVERY}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# render_manifest renders a manifest source (a plain YAML file, a directory of
+# plain YAML, or a Kustomize overlay directory) under manifests/ate-install
+# with image references resolved. Under --pki-delivery=agent the agent-pki
+# component is layered on top so every projected podCertificate and
+# clusterTrustBundle volume becomes a podcert-agent sidecar. The composition
+# happens through a throwaway kustomization next to the sources (Kustomize
+# rejects absolute paths) instead of one static overlay per combination of
+# kind, router, and PKI mode.
+render_manifest() {
+  local source="$1"
+  if [[ "$(pki_delivery)" != "agent" ]]; then
+    if [[ -f "${source}/kustomization.yaml" ]]; then
+      kubectl kustomize "${source}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    else
+      run_ko resolve -f "${source}"
+    fi
+    return
+  fi
+
+  local resource="../${source#manifests/ate-install/}"
+  if [[ -d "${source}" && ! -f "${source}/kustomization.yaml" ]]; then
+    # A plain directory (the GKE base) has a Kustomize twin in ./base.
+    resource="../base"
+  fi
+  local render_dir=""
+  render_dir="$(mktemp -d manifests/ate-install/.render-XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${render_dir}'" RETURN
+  printf '%s\n' \
+    "apiVersion: kustomize.config.k8s.io/v1beta1" \
+    "kind: Kustomization" \
+    "resources:" \
+    "  - ${resource}" \
+    "components:" \
+    "  - ../components/agent-pki" \
+    >"${render_dir}/kustomization.yaml"
+  kubectl kustomize "${render_dir}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+}
+
 podcert_workers_per_signer() {
   local workers="${ATE_INSTALL_PODCERT_WORKERS_PER_SIGNER:-1}"
   if ! [[ "${workers}" =~ ^[1-9][0-9]*$ ]]; then
@@ -212,25 +266,24 @@ render_ate_system_manifests() {
     if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
       overlay="manifests/ate-install/kind-agentgateway"
     fi
-    kubectl kustomize "${overlay}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    render_manifest "${overlay}"
     return
   fi
 
   if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     # Build everything resolved with Kustomize for Kind
-    kubectl kustomize manifests/ate-install/kind --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    render_manifest manifests/ate-install/kind
   else
     # Build everything resolved with base manifests for GKE
-    run_ko resolve -f manifests/ate-install
+    render_manifest manifests/ate-install
   fi
 }
 
 render_atenet_router_manifest() {
   if [[ "$(atenet_router)" == "agentgateway" ]]; then
-    kubectl kustomize manifests/ate-install/agentgateway-router \
-      --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    render_manifest manifests/ate-install/agentgateway-router
   else
-    run_ko resolve -f manifests/ate-install/atenet-router.yaml
+    render_manifest manifests/ate-install/atenet-router.yaml
   fi
 }
 
@@ -262,12 +315,15 @@ render_atenet_egress_manifest() {
     if [[ "${ATE_EXPERIMENTAL_USE_SDSMINT:-false}" == "true" ]]; then
       agentgateway_egress="manifests/ate-install/agentgateway-egress-mitm"
     fi
-    kubectl kustomize "${agentgateway_egress}" \
-      --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    render_manifest "${agentgateway_egress}"
   elif additional_egress_extproc_enabled; then
+    if [[ "$(pki_delivery)" == "agent" ]]; then
+      echo "Error: --experimental-additional-egress-extproc-service is not supported with --pki-delivery=agent" >&2
+      return 1
+    fi
     patch_atenet_egress_manifest | run_ko resolve -f -
   else
-    run_ko resolve -f "$(atenet_egress_manifest)"
+    render_manifest "$(atenet_egress_manifest)"
   fi
 }
 
@@ -437,6 +493,15 @@ create_podcertificate_controller_cas() {
 }
 
 wait_for_podcertificate_trust_bundles() {
+  if [[ "$(pki_delivery)" == "agent" ]]; then
+    echo "Waiting for the podcert-trust-bundles ConfigMap in ate-system..."
+    until run_kubectl -n ate-system get configmap podcert-trust-bundles \
+      -o jsonpath='{.data.podidentity\.podcert\.ate\.dev-identity\.pem}{.data.servicedns\.podcert\.ate\.dev-identity\.pem}' 2>/dev/null \
+      | grep -q "CERTIFICATE"; do
+      sleep 1
+    done
+    return
+  fi
   echo "Waiting for podcertificate ClusterTrustBundles to be ready..."
   until run_kubectl get clustertrustbundles podidentity.podcert.ate.dev:identity:primary-bundle >/dev/null 2>&1; do
     sleep 1
@@ -564,10 +629,13 @@ deploy_ate_system() {
   ensure_apiserver_prerequisites
 
   # Deploy podcertificate-controller first so it starts signing and creating trust bundles immediately
-  run_ko apply -f manifests/ate-install/pod-certificate-controller.yaml
+  render_manifest manifests/ate-install/pod-certificate-controller.yaml | run_kubectl apply -f -
   apply_podcert_workers_override
   run_kubectl rollout status deployment/podcertificate-controller -n podcertificate-controller-system --timeout=120s
 
+  # The trust ConfigMap is published per namespace, so ate-system must exist
+  # before the wait below can succeed in agent mode.
+  run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml
   wait_for_podcertificate_trust_bundles
 
   # CSI setup must run after podcertificate-controller is ready and trust bundles
@@ -575,7 +643,9 @@ deploy_ate_system() {
   # volumes which cannot be fulfilled until podcertcontroller is actively signing,
   # otherwise rollout of csi-hostpath-socat times out.
   if [[ "${SETUP_CSI:-false}" == "true" ]]; then
-    if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+    if [[ "$(pki_delivery)" == "agent" ]]; then
+      echo "Warning: CSI setup still uses projected podCertificate volumes and is not supported with --pki-delivery=agent. Skipping."
+    elif [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
       setup_csi
     else
       echo "Warning: CSI setup is only supported for Kind local installations. Skipping."
@@ -653,10 +723,10 @@ deploy_atelet() {
   local manifest=""
   if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
     # Use Kustomize to build and resolve the atelet DaemonSet patch
-    manifest=$(kubectl kustomize manifests/ate-install/kind/atelet --load-restrictor LoadRestrictionsNone | run_ko resolve -f -)
+    manifest=$(render_manifest manifests/ate-install/kind/atelet)
   else
     # Use base manifest for GKE
-    manifest=$(run_ko resolve -f manifests/ate-install/atelet.yaml)
+    manifest=$(render_manifest manifests/ate-install/atelet.yaml)
   fi
   echo "${manifest}" | run_kubectl apply -f -
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout="$(rollout_timeout)"
@@ -961,6 +1031,14 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       fi
       ATE_ATENET_ROUTER="${prescan_args[$((i + 1))]}"
       ;;
+    --pki-delivery=*) ATE_PKI_DELIVERY="${prescan_args[i]#*=}" ;;
+    --pki-delivery)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --pki-delivery requires projected or agent" >&2
+        exit 1
+      fi
+      ATE_PKI_DELIVERY="${prescan_args[$((i + 1))]}"
+      ;;
     --experimental-use-sdsmint) ATE_EXPERIMENTAL_USE_SDSMINT=true ;;
     --experimental-additional-egress-extproc-service=*)
       ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE="${prescan_args[i]#*=}"
@@ -1037,6 +1115,10 @@ case "${BENCHMARK_SANDBOX_CLASS}" in
 esac
 podcert_workers_per_signer >/dev/null
 rollout_timeout >/dev/null
+if [[ "$(pki_delivery)" == "agent" && "${ATE_EXPERIMENTAL_USE_SDSMINT:-false}" == "true" ]]; then
+  echo "Error: --experimental-use-sdsmint still relies on projected podCertificate volumes and is not supported with --pki-delivery=agent" >&2
+  exit 1
+fi
 
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
@@ -1063,6 +1145,8 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     # Captured in the pre-scan above; matched here only so the `*)` branch does
     # not reject it as an unknown option.
+    --pki-delivery) shift ;;
+    --pki-delivery=*) ;;
     --experimental-use-sdsmint) ;;
     --experimental-additional-egress-extproc-service) shift ;;
     --experimental-additional-egress-extproc-service=*) ;;

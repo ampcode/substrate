@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"fmt"
 	"os"
 	"slices"
 
@@ -27,6 +28,7 @@ import (
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/deviceplugin"
+	"github.com/agent-substrate/substrate/internal/podcertapi"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 )
 
@@ -69,13 +71,50 @@ const (
 	atunnelIdentityMountPath    = "/run/podidentity.podcert.ate.dev"
 	atunnelEgressTrustVolume    = "atunnel-egress-trust"
 	atunnelEgressTrustMountPath = "/run/servicedns.podcert.ate.dev"
+
+	podIdentitySignerName = "podidentity.podcert.ate.dev/identity"
+	serviceDNSSignerName  = "servicedns.podcert.ate.dev/identity"
 )
+
+// PKIDelivery selects how worker pods obtain their podidentity certificate and
+// trust bundles.
+type PKIDelivery string
+
+const (
+	// PKIDeliveryProjected uses kubelet's projected podCertificate and
+	// clusterTrustBundle volumes (certificates.k8s.io/v1beta1; GKE, kind).
+	PKIDeliveryProjected PKIDelivery = "projected"
+	// PKIDeliveryAgent runs a podcert-agent native sidecar that fetches the
+	// same certificate from podcertcontroller's issuer API and copies trust
+	// bundles from the podcert-trust-bundles ConfigMap, for clusters without
+	// the certificates.k8s.io/v1beta1 API (AKS, EKS).
+	PKIDeliveryAgent PKIDelivery = "agent"
+)
+
+// ParsePKIDelivery validates a --pki-delivery flag value.
+func ParsePKIDelivery(s string) (PKIDelivery, error) {
+	switch PKIDelivery(s) {
+	case PKIDeliveryProjected, PKIDeliveryAgent:
+		return PKIDelivery(s), nil
+	case "":
+		return PKIDeliveryProjected, nil
+	}
+	return "", fmt.Errorf("unknown PKI delivery mode %q; want %s or %s", s, PKIDeliveryProjected, PKIDeliveryAgent)
+}
+
+// workerPKISettings describes how worker pods get their certificates.
+type workerPKISettings struct {
+	Delivery PKIDelivery
+	// AgentImage is the podcert-agent image, required for PKIDeliveryAgent.
+	AgentImage string
+}
 
 // buildDeploymentApplyConfig constructs the SSA apply configuration for the
 // Deployment managed by a WorkerPool. Only fields owned by this controller
 // are declared here. otel, when it carries an endpoint, is propagated to the
-// ateom container so it pushes telemetry to that collector.
-func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettings) *appsv1ac.DeploymentApplyConfiguration {
+// ateom container so it pushes telemetry to that collector. pki picks the
+// volumes (and, in agent mode, the sidecar) that deliver the pod's identity.
+func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettings, pki workerPKISettings) *appsv1ac.DeploymentApplyConfiguration {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	if wp.Spec.Template != nil {
@@ -143,36 +182,8 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 				WithHostPath(corev1ac.HostPathVolumeSource().
 					WithPath(ateompath.BasePath).
 					WithType(corev1.HostPathDirectoryOrCreate)),
-			corev1ac.Volume().
-				WithName(atunnelIdentityVolume).
-				WithProjected(corev1ac.ProjectedVolumeSource().
-					WithSources(
-						corev1ac.VolumeProjection().
-							WithPodCertificate(corev1ac.PodCertificateProjection().
-								WithSignerName("podidentity.podcert.ate.dev/identity").
-								WithKeyType("ECDSAP256").
-								WithCredentialBundlePath("credential-bundle.pem")),
-						corev1ac.VolumeProjection().
-							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
-								WithSignerName("podidentity.podcert.ate.dev/identity").
-								WithLabelSelector(metav1ac.LabelSelector().
-									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
-								WithPath("trust-bundle.pem")),
-					),
-				),
-			corev1ac.Volume().
-				WithName(atunnelEgressTrustVolume).
-				WithProjected(corev1ac.ProjectedVolumeSource().
-					WithSources(
-						corev1ac.VolumeProjection().
-							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
-								WithSignerName("servicedns.podcert.ate.dev/identity").
-								WithLabelSelector(metav1ac.LabelSelector().
-									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
-								WithPath("trust-bundle.pem")),
-					),
-				),
 		)
+	applyWorkerPKI(podSpecAC, pki)
 
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
 	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.SandboxClass)
@@ -198,6 +209,108 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 				WithLabels(labels).
 				WithAnnotations(annotations).
 				WithSpec(podSpecAC)))
+}
+
+// applyWorkerPKI adds the volumes that deliver the worker's podidentity
+// credential bundle (mounted at atunnelIdentityMountPath) and the servicedns
+// trust bundle (atunnelEgressTrustMountPath). The files and paths are the same
+// in both modes; only how they get there differs.
+func applyWorkerPKI(podSpecAC *corev1ac.PodSpecApplyConfiguration, pki workerPKISettings) {
+	liveBundle := metav1ac.LabelSelector().
+		WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})
+
+	if pki.Delivery != PKIDeliveryAgent {
+		podSpecAC.WithVolumes(
+			corev1ac.Volume().
+				WithName(atunnelIdentityVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithPodCertificate(corev1ac.PodCertificateProjection().
+								WithSignerName(podIdentitySignerName).
+								WithKeyType("ECDSAP256").
+								WithCredentialBundlePath(podcertapi.CredentialBundleFile)),
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName(podIdentitySignerName).
+								WithLabelSelector(liveBundle).
+								WithPath(podcertapi.TrustBundleFile)),
+					),
+				),
+			corev1ac.Volume().
+				WithName(atunnelEgressTrustVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName(serviceDNSSignerName).
+								WithLabelSelector(liveBundle).
+								WithPath(podcertapi.TrustBundleFile)),
+					),
+				),
+		)
+		return
+	}
+
+	// Agent mode. The sidecar writes into tmpfs emptyDirs that the ateom
+	// container mounts read-only at the usual paths. The startupProbe holds
+	// ateom back until every file exists, matching the projected-volume
+	// guarantee that the files are present before the container starts.
+	const (
+		tokenVolume    = "podcert-token"
+		trustVolume    = "podcert-trust"
+		identityOut    = "/out/identity"
+		egressTrustOut = "/out/egress-trust"
+	)
+	certArgs := []string{
+		"--cert=" + podIdentitySignerName + "=" + identityOut,
+		"--trust=" + serviceDNSSignerName + "=" + egressTrustOut,
+	}
+	podSpecAC.WithVolumes(
+		corev1ac.Volume().
+			WithName(atunnelIdentityVolume).
+			WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory)),
+		corev1ac.Volume().
+			WithName(atunnelEgressTrustVolume).
+			WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory)),
+		corev1ac.Volume().
+			WithName(tokenVolume).
+			WithProjected(corev1ac.ProjectedVolumeSource().
+				WithSources(corev1ac.VolumeProjection().
+					WithServiceAccountToken(corev1ac.ServiceAccountTokenProjection().
+						WithAudience(podcertapi.DefaultAudience).
+						WithExpirationSeconds(3600).
+						WithPath("token")))),
+		corev1ac.Volume().
+			WithName(trustVolume).
+			WithConfigMap(corev1ac.ConfigMapVolumeSource().
+				WithName(podcertapi.TrustConfigMapName)),
+	)
+	podSpecAC.WithInitContainers(corev1ac.Container().
+		WithName("podcert-agent").
+		WithRestartPolicy(corev1.ContainerRestartPolicyAlways).
+		WithImage(pki.AgentImage).
+		WithArgs(certArgs...).
+		WithStartupProbe(corev1ac.Probe().
+			WithExec(corev1ac.ExecAction().
+				WithCommand(append([]string{"/ko-app/podcert-agent", "--check"}, certArgs...)...)).
+			WithPeriodSeconds(1).
+			WithFailureThreshold(300)).
+		WithVolumeMounts(
+			corev1ac.VolumeMount().WithName(tokenVolume).WithMountPath("/var/run/secrets/podcert.ate.dev").WithReadOnly(true),
+			corev1ac.VolumeMount().WithName(trustVolume).WithMountPath("/run/podcert-trust").WithReadOnly(true),
+			corev1ac.VolumeMount().WithName(atunnelIdentityVolume).WithMountPath(identityOut),
+			corev1ac.VolumeMount().WithName(atunnelEgressTrustVolume).WithMountPath(egressTrustOut),
+		).
+		WithSecurityContext(corev1ac.SecurityContext().
+			WithAllowPrivilegeEscalation(false).
+			WithCapabilities(corev1ac.Capabilities().WithDrop("ALL")).
+			WithReadOnlyRootFilesystem(true)).
+		WithResources(corev1ac.ResourceRequirements().
+			WithRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("5m"),
+				corev1.ResourceMemory: resource.MustParse("16Mi"),
+			})))
 }
 
 // ateomContainerEnv adds the OTLP endpoint and resource identity only when

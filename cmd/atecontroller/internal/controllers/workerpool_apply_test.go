@@ -204,7 +204,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{})
+			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{}, workerPKISettings{})
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("buildDeploymentApplyConfig() mismatch (-want +got):\n%s", diff)
 			}
@@ -224,7 +224,7 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 		},
 	})
 
-	got := buildDeploymentApplyConfig(wp, ateomOTelSettings{})
+	got := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{})
 	wantLabels := map[string]string{
 		"project":             "agent-substrate",
 		"team":                "compute",
@@ -248,6 +248,70 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 	}
 }
 
+// TestAgentPKIPodShape asserts agent delivery swaps the two projected PKI
+// volumes for sidecar-fed emptyDirs without moving anything the ateom
+// container sees: same volume names, same mount paths, same file names.
+func TestAgentPKIPodShape(t *testing.T) {
+	const image = "example.com/podcert-agent@sha256:abc"
+	ps := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{},
+		workerPKISettings{Delivery: PKIDeliveryAgent, AgentImage: image}).Spec.Template.Spec
+
+	vols := map[string]corev1ac.VolumeApplyConfiguration{}
+	for _, v := range ps.Volumes {
+		vols[*v.Name] = v
+	}
+	for _, name := range []string{atunnelIdentityVolume, atunnelEgressTrustVolume} {
+		v, ok := vols[name]
+		if !ok {
+			t.Fatalf("volume %s missing", name)
+		}
+		if v.Projected != nil || v.EmptyDir == nil || v.EmptyDir.Medium == nil || *v.EmptyDir.Medium != corev1.StorageMediumMemory {
+			t.Errorf("volume %s should be a tmpfs emptyDir in agent mode, got %+v", name, v.VolumeSourceApplyConfiguration)
+		}
+	}
+	if v, ok := vols["podcert-token"]; !ok || v.Projected == nil || *v.Projected.Sources[0].ServiceAccountToken.Audience != "podcert.ate.dev" {
+		t.Errorf("podcert-token volume must be a projected token for audience podcert.ate.dev, got %+v", v)
+	}
+	if v, ok := vols["podcert-trust"]; !ok || v.ConfigMap == nil || *v.ConfigMap.Name != "podcert-trust-bundles" {
+		t.Errorf("podcert-trust volume must mount ConfigMap podcert-trust-bundles, got %+v", v)
+	}
+
+	if len(ps.InitContainers) != 1 {
+		t.Fatalf("want one init container, got %d", len(ps.InitContainers))
+	}
+	agent := ps.InitContainers[0]
+	if *agent.Name != "podcert-agent" || *agent.Image != image {
+		t.Errorf("sidecar = %s/%s", *agent.Name, *agent.Image)
+	}
+	if agent.RestartPolicy == nil || *agent.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("sidecar must be a native sidecar (restartPolicy: Always)")
+	}
+	if agent.StartupProbe == nil || agent.StartupProbe.Exec == nil || agent.StartupProbe.Exec.Command[1] != "--check" {
+		t.Errorf("sidecar needs a --check startupProbe so ateom waits for the files, got %+v", agent.StartupProbe)
+	}
+	wantArgs := []string{
+		"--cert=podidentity.podcert.ate.dev/identity=/out/identity",
+		"--trust=servicedns.podcert.ate.dev/identity=/out/egress-trust",
+	}
+	if diff := cmp.Diff(wantArgs, agent.Args); diff != "" {
+		t.Errorf("sidecar args mismatch (-want +got):\n%s", diff)
+	}
+
+	// The ateom container is untouched.
+	ateom := ps.Containers[0]
+	mounts := map[string]string{}
+	for _, m := range ateom.VolumeMounts {
+		mounts[*m.Name] = *m.MountPath
+	}
+	if mounts[atunnelIdentityVolume] != atunnelIdentityMountPath || mounts[atunnelEgressTrustVolume] != atunnelEgressTrustMountPath {
+		t.Errorf("ateom mounts changed: %v", mounts)
+	}
+	projected := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec.Containers[0]
+	if diff := cmp.Diff(projected, ateom); diff != "" {
+		t.Errorf("ateom container differs between delivery modes (-projected +agent):\n%s", diff)
+	}
+}
+
 // TestMicroVMPodShape asserts the micro-VM sandbox class requests the host
 // devices as extended resources (served by atelet's device plugin) and
 // tolerates the ate.dev/sandboxClass taint; other classes get none of it.
@@ -266,7 +330,7 @@ func TestMicroVMPodShape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.SandboxClass = tt.class
-			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec
 
 			// /dev/kvm must come from the device plugin, never a hostPath: a
 			// hostPath mount carries no cgroup device allow rule, and the
@@ -359,7 +423,7 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 		},
 	})
 	wp.Spec.SandboxClass = atev1alpha1.SandboxClassMicroVM
-	c := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec.Containers[0]
+	c := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec.Containers[0]
 
 	if got, ok := deviceLimit(c, string(corev1.ResourceMemory)); !ok || got != "2Gi" {
 		t.Errorf("memory limit = %q (present=%v), want 2Gi", got, ok)
@@ -427,7 +491,7 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 // TestTerminationGracePeriodSeconds asserts the pod's grace period is hardcoded to 3600s.
 func TestTerminationGracePeriodSeconds(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec
 	if ps.TerminationGracePeriodSeconds == nil {
 		t.Fatalf("TerminationGracePeriodSeconds not set")
 	}
@@ -451,7 +515,7 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 
@@ -529,7 +593,7 @@ func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
@@ -586,7 +650,7 @@ func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"} {
@@ -637,7 +701,7 @@ func TestGPUPoolMountsToolkit(t *testing.T) {
 			},
 		},
 	}
-	dep := buildDeploymentApplyConfig(wp, ateomOTelSettings{})
+	dep := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{})
 	pod := dep.Spec.Template.Spec
 
 	var found bool
@@ -697,7 +761,7 @@ func TestGPUPoolDriverRootEnv(t *testing.T) {
 		}
 	}
 	driverRootEnv := func(wp *atev1alpha1.WorkerPool) (string, bool) {
-		for _, c := range buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec.Containers {
+		for _, c := range buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec.Containers {
 			for _, e := range c.Env {
 				if e.Name != nil && *e.Name == nvidiaDriverRootEnv {
 					return *e.Value, true
@@ -723,7 +787,7 @@ func TestNonGPUPoolHasNoToolkit(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "wp", Namespace: "ns"},
 		Spec:       atev1alpha1.WorkerPoolSpec{WorkerImage: "img"},
 	}
-	dep := buildDeploymentApplyConfig(wp, ateomOTelSettings{})
+	dep := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{})
 	pod := dep.Spec.Template.Spec
 	for _, v := range pod.Volumes {
 		if v.Name != nil && *v.Name == "nvidia-toolkit" {
@@ -769,7 +833,7 @@ func TestGPUMicroVMPoolHasNoGPUPodShape(t *testing.T) {
 			},
 		},
 	}
-	pod := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+	pod := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, workerPKISettings{}).Spec.Template.Spec
 
 	for _, v := range pod.Volumes {
 		if v.Name != nil && *v.Name == "nvidia-toolkit" {

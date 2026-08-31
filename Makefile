@@ -46,6 +46,7 @@ build-images:
 	    ./cmd/ateapi \
 	    ./cmd/atelet \
 	    ./cmd/podcertcontroller \
+	    ./cmd/podcert-agent \
 	    ./cmd/atenet
 
 .PHONY: build-atectl

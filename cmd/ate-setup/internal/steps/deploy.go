@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/kube"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
 )
@@ -74,7 +75,7 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 
 	// The podcertificate controller goes first so it starts signing and
 	// publishing trust bundles immediately.
-	if err := e.KoApply(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml")); err != nil {
+	if err := e.applyPodCertificateController(ctx); err != nil {
 		return err
 	}
 	if err := e.applyPodcertWorkersOverride(ctx); err != nil {
@@ -88,7 +89,9 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 	}
 
 	if opts.SetupCSI {
-		if !e.Cfg.Kind {
+		if e.AgentPKI() {
+			log.Warnf("CSI setup still uses projected podCertificate volumes and is not supported with --pki-delivery=%s. Skipping.", config.PKIDeliveryAgent)
+		} else if !e.Cfg.Kind {
 			log.Warnf("CSI setup is only supported for Kind local installations. Skipping.")
 		} else if err := e.SetupCSI(ctx); err != nil {
 			return err
@@ -231,9 +234,9 @@ func (e *Env) DeployAtelet(ctx context.Context) error {
 	var err error
 	if e.Cfg.Kind {
 		// The kind overlay patches the DaemonSet for the local node layout.
-		manifest, err = e.KustomizeResolve(ctx, installDir+"/kind/atelet")
+		manifest, err = e.RenderManifest(ctx, e.Cfg.Manifest("kind", "atelet"))
 	} else {
-		manifest, err = e.KoResolve(ctx, e.Cfg.Manifest("atelet.yaml"))
+		manifest, err = e.RenderManifest(ctx, e.Cfg.Manifest("atelet.yaml"))
 	}
 	if err != nil {
 		return err

@@ -31,6 +31,9 @@ if [[ $# -gt 0 ]]; then
       echo "Configured through the environment:"
       echo "  KIND_CLUSTER_NAME  Name of the cluster to create (default: kind)."
       echo "  IP_FAMILY          Address families for pods and Services: ipv4, ipv6 or dual (default: ipv4)."
+      echo "  PODCERT_API        enabled (default) turns on the certificates.k8s.io/v1beta1 feature gates"
+      echo "                     Substrate's projected PKI needs. disabled leaves them off, like AKS or EKS,"
+      echo "                     for testing hack/install-ate.sh --pki-delivery=agent."
       exit 0
       ;;
   esac
@@ -44,6 +47,16 @@ case "${IP_FAMILY}" in
     ;;
   *)
     echo "error: IP_FAMILY must be one of ipv4, ipv6, dual (got '${IP_FAMILY}')" >&2
+    exit 1
+    ;;
+esac
+
+PODCERT_API="${PODCERT_API:-enabled}"
+case "${PODCERT_API}" in
+  enabled|disabled)
+    ;;
+  *)
+    echo "error: PODCERT_API must be enabled or disabled (got '${PODCERT_API}')" >&2
     exit 1
     ;;
 esac
@@ -100,7 +113,8 @@ if [ "${HAS_KVM}" = "1" ]; then
     containerPath: /dev/kvm
 EOF
 fi
-cat <<EOF >> "${ROOT}/bin/kind-config.yaml"
+if [[ "${PODCERT_API}" == "enabled" ]]; then
+  cat <<EOF >> "${ROOT}/bin/kind-config.yaml"
 # cmd/podcertcontroller depends on ClusterTrustBundle & PodCertificateRequest.
 # They are not enabled by default as of Kubernetes v1.36
 # https://github.com/kubernetes/kubernetes/blob/master/test/compatibility_lifecycle/reference/versioned_feature_list.yaml
@@ -110,6 +124,17 @@ featureGates:
   PodCertificateRequest: true
 runtimeConfig:
   "certificates.k8s.io/v1beta1": "true"
+EOF
+else
+  cat <<EOF >> "${ROOT}/bin/kind-config.yaml"
+# PODCERT_API=disabled: the certificates.k8s.io/v1beta1 gates stay at their
+# upstream defaults (off), as on AKS and EKS. Install with
+# hack/install-ate.sh --pki-delivery=agent.
+runtimeConfig:
+  "certificates.k8s.io/v1beta1": "false"
+EOF
+fi
+cat <<EOF >> "${ROOT}/bin/kind-config.yaml"
 networking:
   ipFamily: ${IP_FAMILY}
 EOF

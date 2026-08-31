@@ -26,9 +26,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/egressmitmtrust"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	certlisters "k8s.io/client-go/listers/certificates/v1beta1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -51,7 +54,7 @@ func testCertPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-func ctbLister(t *testing.T, bundles ...*certsv1beta1.ClusterTrustBundle) certlisters.ClusterTrustBundleLister {
+func ctbLister(t *testing.T, bundles ...*certsv1beta1.ClusterTrustBundle) trustBundleSource {
 	t.Helper()
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	for _, b := range bundles {
@@ -59,7 +62,20 @@ func ctbLister(t *testing.T, bundles ...*certsv1beta1.ClusterTrustBundle) certli
 			t.Fatal(err)
 		}
 	}
-	return certlisters.NewClusterTrustBundleLister(indexer)
+	return clusterTrustBundleSource{lister: certlisters.NewClusterTrustBundleLister(indexer)}
+}
+
+// cmSource is the agent-mode counterpart of ctbLister: a ConfigMap-backed
+// trust bundle source over the given ConfigMaps in ate-system.
+func cmSource(t *testing.T, cms ...*corev1.ConfigMap) trustBundleSource {
+	t.Helper()
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, cm := range cms {
+		if err := indexer.Add(cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return configMapTrustBundleSource{lister: corelisters.NewConfigMapLister(indexer).ConfigMaps(egressmitmtrust.Namespace)}
 }
 
 // egressTrustBundleObjectName is the backing ClusterTrustBundle the allowlist
@@ -122,8 +138,41 @@ func TestResolveTrustBundle(t *testing.T) {
 		// informer at boot); it must fail the actor start, not panic the
 		// node daemon.
 		_, err := resolveTrustBundle(nil, EgressTrustBundleName)
-		if err == nil || !strings.Contains(err.Error(), "no ClusterTrustBundle lister") {
-			t.Errorf("error = %v, want no-lister error", err)
+		if err == nil || !strings.Contains(err.Error(), "no trust bundle source") {
+			t.Errorf("error = %v, want no-source error", err)
+		}
+	})
+
+	// Agent PKI delivery: the same bundle arrives as a ConfigMap in ate-system.
+	t.Run("configmap source resolves and sanitizes", func(t *testing.T) {
+		source := cmSource(t, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName},
+			Data:       map[string]string{egressmitmtrust.ConfigMapKey: junk + string(certPEM)},
+		})
+		got, err := resolveTrustBundle(source, EgressTrustBundleName)
+		if err != nil {
+			t.Fatalf("resolveTrustBundle: %v", err)
+		}
+		if string(got) != string(certPEM) {
+			t.Errorf("pem bundle = %q, want the sanitized certificate", got)
+		}
+	})
+
+	t.Run("configmap source missing fails naming the ConfigMap", func(t *testing.T) {
+		_, err := resolveTrustBundle(cmSource(t), EgressTrustBundleName)
+		if err == nil || !strings.Contains(err.Error(), "ConfigMap "+egressmitmtrust.Namespace+"/"+egressmitmtrust.ConfigMapName) || !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error = %v, want not-found naming the ConfigMap", err)
+		}
+	})
+
+	t.Run("configmap source without the key fails", func(t *testing.T) {
+		source := cmSource(t, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName},
+			Data:       map[string]string{"other": string(certPEM)},
+		})
+		_, err := resolveTrustBundle(source, EgressTrustBundleName)
+		if err == nil || !strings.Contains(err.Error(), egressmitmtrust.ConfigMapKey) {
+			t.Errorf("error = %v, want missing-key error", err)
 		}
 	})
 }

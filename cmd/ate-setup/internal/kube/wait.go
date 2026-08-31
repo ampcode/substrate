@@ -17,6 +17,7 @@ package kube
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -249,6 +250,35 @@ func (c *Client) WaitClusterTrustBundles(ctx context.Context, names []string, ti
 			}
 			return fmt.Errorf("waiting for ClusterTrustBundle %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// WaitConfigMapKeys blocks until the ConfigMap exists and every key holds a
+// PEM certificate. This is the agent-delivery counterpart of
+// WaitClusterTrustBundles: the podcertificate controller publishes its trust
+// bundles into a ConfigMap on clusters without certificates.k8s.io/v1beta1.
+func (c *Client) WaitConfigMapKeys(ctx context.Context, namespace, name string, keys []string, timeout time.Duration) error {
+	var missing string
+	err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
+		cm, err := c.Typed.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				missing = "the ConfigMap"
+				return false, nil
+			}
+			return false, fmt.Errorf("while getting configmap %s/%s: %w", namespace, name, err)
+		}
+		for _, key := range keys {
+			if !strings.Contains(cm.Data[key], "CERTIFICATE") {
+				missing = "key " + key
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for ConfigMap %s/%s (%s not ready): %w", namespace, name, missing, err)
 	}
 	return nil
 }
