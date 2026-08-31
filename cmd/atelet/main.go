@@ -42,6 +42,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/atelet"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/credbundle"
+	"github.com/agent-substrate/substrate/internal/egressmitmtrust"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/ocispec"
 	"github.com/agent-substrate/substrate/internal/otlprelay"
@@ -80,6 +81,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/lru"
 )
 
@@ -91,7 +93,10 @@ var (
 	clientCACerts        = pflag.String("client-ca-certs", "/run/podidentity.podcert.ate.dev/trust-bundle.pem", "CA bundle used to verify gRPC client certificates.")
 	ateapiAddress        = pflag.String("ateapi-address", "k8s:///api.ate-system.svc:443", "ateapi gRPC target used by the credential broker.")
 	ateapiCAFile         = pflag.String("ateapi-ca-file", "/run/servicedns.podcert.ate.dev/trust-bundle.pem", "CA bundle used to verify ateapi.")
-	ateapiServerName     = pflag.String("ateapi-server-name", "api.ate-system.svc", "DNS name expected on the ateapi certificate.")
+
+	egressMITMTrustSource = pflag.String("egress-mitm-trust-source", "clustertrustbundle",
+		"Where the egress MITM trust bundle is read from: clustertrustbundle (certificates.k8s.io/v1beta1) or configmap ("+egressmitmtrust.Namespace+"/"+egressmitmtrust.ConfigMapName+", for clusters without that API).")
+	ateapiServerName = pflag.String("ateapi-server-name", "api.ate-system.svc", "DNS name expected on the ateapi certificate.")
 
 	gcpAuthForImagePulls         = pflag.Bool("gcp-auth-for-image-pulls", true, "Use GCP application default credentials mechanism.")
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
@@ -270,19 +275,47 @@ func main() {
 	ateFactory := externalversions.NewSharedInformerFactory(ateClient, 0)
 	csiDriverConfigLister := ateFactory.Api().V1alpha1().CSIDriverConfigs().Lister()
 
-	clusterTrustBundleInformerFactory := informers.NewSharedInformerFactoryWithOptions(k8sClient, 24*time.Hour,
-		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
-			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", supportedTrustBundles[EgressTrustBundleName]).String()
-		}))
-	clusterTrustBundles := clusterTrustBundleInformerFactory.Certificates().V1beta1().ClusterTrustBundles()
-	systemInfoVolumes := newSystemInfoVolumeRefresher(clusterTrustBundles.Lister(), clusterTrustBundles.Informer())
+	// Start an informer on the object carrying the egress trust bundle
+	// (currently the only supported trust bundle). Which object depends on how
+	// this cluster delivers PKI: a ClusterTrustBundle where
+	// certificates.k8s.io/v1beta1 is served, otherwise the ConfigMap
+	// atecontroller maintains in ate-system. The v1beta1 API is feature-gated:
+	// on a cluster that does not serve it, startup blocks at WaitForCacheSync
+	// below, with the reflector's errors naming the missing API.
+	var trustBundleInformerFactory informers.SharedInformerFactory
+	var bundleSource trustBundleSource
+	var trustBundleInformer cache.SharedIndexInformer
+	egressObjects := supportedTrustBundles[EgressTrustBundleName]
+	switch *egressMITMTrustSource {
+	case "clustertrustbundle":
+		trustBundleInformerFactory = informers.NewSharedInformerFactoryWithOptions(k8sClient, 24*time.Hour,
+			informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+				o.FieldSelector = fields.OneTermEqualSelector("metadata.name", egressObjects.clusterTrustBundle).String()
+			}))
+		clusterTrustBundles := trustBundleInformerFactory.Certificates().V1beta1().ClusterTrustBundles()
+		bundleSource = clusterTrustBundleSource{lister: clusterTrustBundles.Lister()}
+		trustBundleInformer = clusterTrustBundles.Informer()
+	case "configmap":
+		trustBundleInformerFactory = informers.NewSharedInformerFactoryWithOptions(k8sClient, 24*time.Hour,
+			informers.WithNamespace(egressmitmtrust.Namespace),
+			informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+				o.FieldSelector = fields.OneTermEqualSelector("metadata.name", egressObjects.configMap).String()
+			}))
+		configMaps := trustBundleInformerFactory.Core().V1().ConfigMaps()
+		bundleSource = configMapTrustBundleSource{lister: configMaps.Lister().ConfigMaps(egressmitmtrust.Namespace)}
+		trustBundleInformer = configMaps.Informer()
+	default:
+		slog.ErrorContext(ctx, "Invalid --egress-mitm-trust-source; want clustertrustbundle or configmap", slog.String("value", *egressMITMTrustSource))
+		os.Exit(1)
+	}
+	systemInfoVolumes := newSystemInfoVolumeRefresher(bundleSource, trustBundleInformer)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	ateFactory.Start(stopCh)
-	clusterTrustBundleInformerFactory.Start(stopCh)
+	trustBundleInformerFactory.Start(stopCh)
 	ateFactory.WaitForCacheSync(stopCh)
-	clusterTrustBundleInformerFactory.WaitForCacheSync(stopCh)
+	trustBundleInformerFactory.WaitForCacheSync(stopCh)
 
 	wmService := NewService(
 		ctx,

@@ -67,6 +67,13 @@ rules:
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
+# Under agent PKI delivery (--egress-mitm-trust-source=configmap) the egress
+# trust bundle is read from ConfigMap ate-system/egress-mitm-trust instead of
+# a ClusterTrustBundle.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["egress-mitm-trust"]
+  verbs: ["get", "watch", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

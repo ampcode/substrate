@@ -74,6 +74,30 @@ rules:
   - events
   verbs:
   - create
+# Agent delivery mode (--serve-issuer-api), for clusters without the
+# certificates.k8s.io/v1beta1 API: the issuer attests podcert-agent requests
+# with TokenReview, and the trust publisher maintains the podcert-trust-bundles
+# ConfigMap in every namespace.
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - create
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -149,6 +173,9 @@ spec:
         - --service-dns-ca-pool=/run/ca-state/service-dns-pool.json
         - --pod-identity-ca-pool=/run/ca-state/pod-identity-pool.json
         - --workers-per-signer=$(WORKERS_PER_SIGNER)
+        ports:
+        - name: issuer
+          containerPort: 8443
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -197,3 +224,19 @@ spec:
       securityContext: {}
       serviceAccountName: default
       terminationGracePeriodSeconds: 30
+---
+# The issuer API endpoint podcert-agent sidecars call in agent delivery mode.
+# Its serving certificate is minted from the servicedns CA pool for this DNS
+# name, so agents verify it with the servicedns trust bundle.
+apiVersion: v1
+kind: Service
+metadata:
+  name: podcert-issuer
+  namespace: podcertificate-controller-system
+spec:
+  selector:
+    app: podcertificate-controller
+  ports:
+  - name: https
+    port: 443
+    targetPort: issuer

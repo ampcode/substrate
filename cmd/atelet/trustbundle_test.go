@@ -27,9 +27,13 @@ import (
 	"time"
 
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	certlisters "k8s.io/client-go/listers/certificates/v1beta1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/agent-substrate/substrate/internal/egressmitmtrust"
 )
 
 // testCertPEM mints a throwaway self-signed certificate, PEM-encoded.
@@ -62,6 +66,19 @@ func ctbLister(t *testing.T, bundles ...*certsv1beta1.ClusterTrustBundle) certli
 	return certlisters.NewClusterTrustBundleLister(indexer)
 }
 
+// cmSource is the agent-mode counterpart of ctbLister: a ConfigMap-backed
+// trust bundle source over the given ConfigMaps in ate-system.
+func cmSource(t *testing.T, cms ...*corev1.ConfigMap) trustBundleSource {
+	t.Helper()
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, cm := range cms {
+		if err := indexer.Add(cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return configMapTrustBundleSource{lister: corelisters.NewConfigMapLister(indexer).ConfigMaps(egressmitmtrust.Namespace)}
+}
+
 // egressTrustBundleObjectName is the backing ClusterTrustBundle the allowlist
 // maps EgressTrustBundleName to (named by atecontroller's reconciler).
 const egressTrustBundleObjectName = "egress-mitm.ate.dev:mitm:primary-bundle"
@@ -75,7 +92,7 @@ func TestRawTrustBundle(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: egressTrustBundleObjectName},
 			Spec:       certsv1beta1.ClusterTrustBundleSpec{TrustBundle: raw},
 		})
-		objectName, got, err := rawTrustBundle(lister, EgressTrustBundleName)
+		objectName, got, err := rawTrustBundle(clusterTrustBundleSource{lister: lister}, EgressTrustBundleName)
 		if err != nil {
 			t.Fatalf("rawTrustBundle: %v", err)
 		}
@@ -94,16 +111,80 @@ func TestRawTrustBundle(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "my-own-bundle"},
 			Spec:       certsv1beta1.ClusterTrustBundleSpec{TrustBundle: string(certPEM)},
 		})
-		_, _, err := rawTrustBundle(lister, "my-own-bundle")
+		_, _, err := rawTrustBundle(clusterTrustBundleSource{lister: lister}, "my-own-bundle")
 		if err == nil || !strings.Contains(err.Error(), `"my-own-bundle"`) || !strings.Contains(err.Error(), "not supported") || !strings.Contains(err.Error(), EgressTrustBundleName) {
 			t.Errorf("error = %v, want unsupported-name error listing the allowlist", err)
 		}
 	})
 
 	t.Run("missing bundle fails naming it", func(t *testing.T) {
-		_, _, err := rawTrustBundle(ctbLister(t), EgressTrustBundleName)
+		_, _, err := rawTrustBundle(clusterTrustBundleSource{lister: ctbLister(t)}, EgressTrustBundleName)
 		if err == nil || !strings.Contains(err.Error(), egressTrustBundleObjectName) || !strings.Contains(err.Error(), "not found") {
 			t.Errorf("error = %v, want not-found naming the backing object", err)
 		}
 	})
+
+	t.Run("nil source fails naming the bundle", func(t *testing.T) {
+		_, _, err := rawTrustBundle(nil, EgressTrustBundleName)
+		if err == nil || !strings.Contains(err.Error(), "no trust bundle source") {
+			t.Errorf("error = %v, want no-source error", err)
+		}
+	})
+
+	// Agent PKI delivery: the same bundle arrives as a ConfigMap in ate-system.
+	t.Run("configmap source resolves through the mapped object", func(t *testing.T) {
+		raw := "garbage\n" + string(certPEM)
+		source := cmSource(t, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName},
+			Data:       map[string]string{egressmitmtrust.ConfigMapKey: raw},
+		})
+		objectName, got, err := rawTrustBundle(source, EgressTrustBundleName)
+		if err != nil {
+			t.Fatalf("rawTrustBundle: %v", err)
+		}
+		if want := egressmitmtrust.Namespace + "/" + egressmitmtrust.ConfigMapName; objectName != want {
+			t.Errorf("objectName = %q, want %q", objectName, want)
+		}
+		if got != raw {
+			t.Errorf("raw = %q, want the ConfigMap contents verbatim", got)
+		}
+	})
+
+	t.Run("configmap source missing fails naming the ConfigMap", func(t *testing.T) {
+		_, _, err := rawTrustBundle(cmSource(t), EgressTrustBundleName)
+		if err == nil || !strings.Contains(err.Error(), "ConfigMap") || !strings.Contains(err.Error(), egressmitmtrust.Namespace+"/"+egressmitmtrust.ConfigMapName) || !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error = %v, want not-found naming the ConfigMap", err)
+		}
+	})
+
+	t.Run("configmap source without the key fails", func(t *testing.T) {
+		source := cmSource(t, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName},
+			Data:       map[string]string{"other": string(certPEM)},
+		})
+		_, _, err := rawTrustBundle(source, EgressTrustBundleName)
+		if err == nil || !strings.Contains(err.Error(), egressmitmtrust.ConfigMapKey) {
+			t.Errorf("error = %v, want missing-key error", err)
+		}
+	})
+}
+
+func TestBundleNamesFor(t *testing.T) {
+	ctb := clusterTrustBundleSource{}
+	if got := bundleNamesFor(ctb, egressTrustBundleObjectName); len(got) != 1 || got[0] != EgressTrustBundleName {
+		t.Errorf("bundleNamesFor(ctb, %q) = %v, want [%s]", egressTrustBundleObjectName, got, EgressTrustBundleName)
+	}
+	cm := configMapTrustBundleSource{}
+	cmName := egressmitmtrust.Namespace + "/" + egressmitmtrust.ConfigMapName
+	if got := bundleNamesFor(cm, cmName); len(got) != 1 || got[0] != EgressTrustBundleName {
+		t.Errorf("bundleNamesFor(cm, %q) = %v, want [%s]", cmName, got, EgressTrustBundleName)
+	}
+	// The ClusterTrustBundle's name is not the ConfigMap's; a ConfigMap event
+	// carrying it must not trigger a refresh.
+	if got := bundleNamesFor(cm, egressTrustBundleObjectName); len(got) != 0 {
+		t.Errorf("bundleNamesFor(cm, ctb name) = %v, want none", got)
+	}
+	if name, ok := cm.eventObjectName(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "other", Name: egressmitmtrust.ConfigMapName}}); ok {
+		t.Errorf("eventObjectName accepted a ConfigMap outside %s: %q", egressmitmtrust.Namespace, name)
+	}
 }

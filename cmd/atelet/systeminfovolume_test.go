@@ -124,7 +124,7 @@ func TestSystemInfoVolumeRefresher_RefreshesRunningActorsOnChange(t *testing.T) 
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 
 	// Two running actors project the same bundle; a rotation must rewrite
@@ -166,7 +166,7 @@ func TestSystemInfoVolumeRefresher_KeepsLastGoodOnFailure(t *testing.T) {
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-1")
 
@@ -204,7 +204,7 @@ func TestSystemInfoVolumeRefresher_Deregister(t *testing.T) {
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-1")
 
@@ -221,7 +221,7 @@ func TestSystemInfoVolumeRefresher_RegisterEmptyStopsRefreshing(t *testing.T) {
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-1")
 
@@ -248,10 +248,10 @@ func TestSystemInfoVolumeRefresher_RegisterRewritesFromCurrentState(t *testing.T
 	store := newCTBStore(t)
 	store.set(t, certA)
 	dir := t.TempDir()
-	registerTrustVolume(t, newSystemInfoVolumeRefresher(store.lister, nil), dir, "uid-1")
+	registerTrustVolume(t, newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil), dir, "uid-1")
 
 	store.set(t, certB)
-	registerTrustVolume(t, newSystemInfoVolumeRefresher(store.lister, nil), dir, "uid-1")
+	registerTrustVolume(t, newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil), dir, "uid-1")
 	if got := readProjected(t, dir, "uid-1", "trust", "ca.pem"); got != certB {
 		t.Errorf("projected file = %q, want the rotation missed while down applied at registration", got)
 	}
@@ -265,7 +265,7 @@ func TestSystemInfoVolumeRefresher_WriteFailureIsolatedAndRetried(t *testing.T) 
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	for _, uid := range []string{"uid-1", "uid-2"} {
 		registerTrustVolume(t, r, dir, uid)
@@ -313,7 +313,7 @@ func TestSystemInfoVolumeRefresher_EventPipelineRetriesFailedWrites(t *testing.T
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-1")
 
@@ -355,7 +355,7 @@ func TestSystemInfoVolumeRefresher_RotationLeavesUnchangedFilesAlone(t *testing.
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	root := filepath.Join(t.TempDir(), "system-info", "vol1")
 	spec := &ateletpb.SystemInfoVolume{
 		DataSources: append(metadataVolumeSpec().GetDataSources(), trustVolumeSpec("trust/ca.pem").GetDataSources()...),
@@ -490,7 +490,7 @@ func TestSystemInfoVolumeRefresher_LifecycleUnblockedDuringRefresh(t *testing.T)
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-a")
 	registerTrustVolume(t, r, dir, "uid-b")
@@ -533,7 +533,7 @@ func TestSystemInfoVolumeRefresher_LifecycleUnblockedDuringRefresh(t *testing.T)
 func TestSystemInfoVolumeRefresher_DeregisterMarksStale(t *testing.T) {
 	store := newCTBStore(t)
 	store.set(t, string(testCertPEM(t)))
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 
 	registerTrustVolume(t, r, dir, "uid-1")
@@ -547,7 +547,7 @@ func TestSystemInfoVolumeRefresher_DeregisterMarksStale(t *testing.T) {
 func TestSystemInfoVolumeRefresher_RegisterTwiceSupersedes(t *testing.T) {
 	store := newCTBStore(t)
 	store.set(t, string(testCertPEM(t)))
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 	registerTrustVolume(t, r, dir, "uid-1")
 	first := r.actors["uid-1"]
@@ -589,7 +589,7 @@ func TestSystemInfoVolumeRefresher_ConcurrentLifecycle(t *testing.T) {
 	certA, certB := string(testCertPEM(t)), string(testCertPEM(t))
 	store := newCTBStore(t)
 	store.set(t, certA)
-	r := newSystemInfoVolumeRefresher(store.lister, nil)
+	r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 	dir := t.TempDir()
 
 	var wg sync.WaitGroup
@@ -663,13 +663,13 @@ func TestSystemInfoVolumeRegister_TrustBundle(t *testing.T) {
 	store := newCTBStore(t)
 	store.set(t, junk+string(certPEM)+string(certPEM))
 	dir := t.TempDir()
-	registerTrustVolume(t, newSystemInfoVolumeRefresher(store.lister, nil), dir, "uid-1")
+	registerTrustVolume(t, newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil), dir, "uid-1")
 	if got := readProjected(t, dir, "uid-1", "trust", "ca.pem"); got != string(certPEM) {
 		t.Errorf("content = %q, want the sanitized bundle", got)
 	}
 
 	t.Run("resolution failure fails the start rather than produce an empty trust file", func(t *testing.T) {
-		r := newSystemInfoVolumeRefresher(ctbLister(t), nil)
+		r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: ctbLister(t)}, nil)
 		vol := &systemInfoVolume{Name: "trust", Root: filepath.Join(t.TempDir(), "trust"), Spec: trustVolumeSpec("ca.pem")}
 		err := r.Register("uid-2", resources.ActorRef{Atespace: "team-a", Name: "actor-2"}, []*systemInfoVolume{vol})
 		if err == nil || !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), `"trust"`) {
@@ -678,7 +678,7 @@ func TestSystemInfoVolumeRegister_TrustBundle(t *testing.T) {
 	})
 
 	t.Run("re-registration supersedes stale entry without panicking", func(t *testing.T) {
-		r := newSystemInfoVolumeRefresher(store.lister, nil)
+		r := newSystemInfoVolumeRefresher(clusterTrustBundleSource{lister: store.lister}, nil)
 		dir1 := t.TempDir()
 		dir2 := t.TempDir()
 		registerTrustVolume(t, r, dir1, "uid-rereg")

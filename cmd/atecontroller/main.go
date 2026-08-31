@@ -22,6 +22,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/atecontroller/internal/controllers"
 	"github.com/agent-substrate/substrate/cmd/atecontroller/internal/workersync"
 	"github.com/agent-substrate/substrate/internal/ateapiauth"
+	"github.com/agent-substrate/substrate/internal/egressmitmtrust"
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/version"
@@ -76,6 +77,13 @@ var (
 
 	ateletServiceAccount = pflag.String("atelet-service-account", installdefaults.AteletServiceAccount, "ServiceAccount atelet runs as. It is the service-account segment of the SPIFFE ID each worker's atunnel expects on the credential broker, so it has to match what the deployment actually creates.")
 	routerServiceAccount = pflag.String("router-service-account", installdefaults.RouterServiceAccount, "ServiceAccount atenet-router runs as. It is the service-account segment of the SPIFFE ID each worker's atunnel accepts on actor ingress, so it has to match what the deployment actually creates.")
+
+	pkiDelivery = pflag.String("pki-delivery", "projected",
+		"How worker pods get their podidentity certificate: projected (kubelet projected podCertificate volumes, certificates.k8s.io/v1beta1) or agent (podcert-agent sidecar, for clusters without that API).")
+	podcertAgentImage = pflag.String("podcert-agent-image", os.Getenv("PODCERT_AGENT_IMAGE"),
+		"podcert-agent sidecar image for --pki-delivery=agent. Defaults to $PODCERT_AGENT_IMAGE.")
+	egressMITMTrustSink = pflag.String("egress-mitm-trust-sink", "clustertrustbundle",
+		"Where the egress MITM trust bundle is published: clustertrustbundle (certificates.k8s.io/v1beta1) or configmap ("+egressmitmtrust.Namespace+"/"+egressmitmtrust.ConfigMapName+", for clusters without that API). Must match atelet's --egress-mitm-trust-source.")
 
 	ateapiCAFile     = pflag.String("ateapi-ca-file", ateapiauth.DefaultServiceAccountCAFile, "PEM file with CAs trusted to verify the ateapi server cert.")
 	ateapiServerName = pflag.String("ateapi-server-name", "", "SNI / hostname expected on the ateapi server cert. Optional.")
@@ -187,6 +195,15 @@ func main() {
 						},
 					},
 				},
+				// Only watched under --egress-mitm-trust-sink=configmap; scoped
+				// so the cache never holds every ConfigMap in the cluster.
+				&corev1.ConfigMap{}: {
+					Namespaces: map[string]cache.Config{
+						egressmitmtrust.Namespace: {
+							FieldSelector: fields.OneTermEqualSelector("metadata.name", egressmitmtrust.ConfigMapName),
+						},
+					},
+				},
 			},
 		},
 	})
@@ -195,9 +212,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	pkiMode, err := controllers.ParsePKIDelivery(*pkiDelivery)
+	if err != nil {
+		setupLog.Error(err, "invalid --pki-delivery")
+		os.Exit(1)
+	}
+	if pkiMode == controllers.PKIDeliveryAgent && *podcertAgentImage == "" {
+		setupLog.Error(nil, "--pki-delivery=agent requires --podcert-agent-image (or $PODCERT_AGENT_IMAGE)")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.WorkerPoolReconciler{
 		Client:                   mgr.GetClient(),
 		Scheme:                   mgr.GetScheme(),
+		PKIDelivery:              pkiMode,
+		PodcertAgentImage:        *podcertAgentImage,
 		OTelEndpoint:             *otelEndpoint,
 		OTelMetricExportInterval: *otelMetricExportInterval,
 		OTelMetricExportTimeout:  *otelMetricExportTimeout,
@@ -220,9 +249,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	trustSink, err := controllers.ParseEgressMITMTrustSink(*egressMITMTrustSink)
+	if err != nil {
+		setupLog.Error(err, "invalid --egress-mitm-trust-sink")
+		os.Exit(1)
+	}
 	if err = (&controllers.EgressMITMTrustReconciler{
 		Client:          mgr.GetClient(),
 		SystemNamespace: systemNamespace,
+		Sink:            trustSink,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EgressMITMTrust")
 		os.Exit(1)
