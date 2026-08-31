@@ -80,6 +80,9 @@ const (
 	ClusterName          = "ate-cluster"
 	OtlpClusterName      = "otel_collector_cluster"
 	HTTPSCertSecretName  = "https_serving_cert"
+	// UpstreamClientCertSecretName is the SDS secret carrying the podidentity
+	// client cert the ORIGINAL_DST actor cluster presents to atunnel.
+	UpstreamClientCertSecretName = "actor_upstream_client_cert"
 
 	// httpProtocolOptionsName is the well-known extension key Envoy looks for in
 	// a cluster's typed_extension_protocol_options. It must match the message's
@@ -460,6 +463,9 @@ func (x *XdsServer) UpdateSnapshot() error {
 	if needsCert {
 		secrets = append(secrets, x.buildTlsSecret())
 	}
+	if x.upstreamCredentialBundlePath != "" {
+		secrets = append(secrets, x.buildUpstreamClientCertSecret())
+	}
 
 	// Snapshot
 	snapshot, err := cachev3.NewSnapshot(ver, map[resourcev3.Type][]types.Resource{
@@ -623,19 +629,26 @@ func (x *XdsServer) buildOtlpCollectorCluster() *clusterv3.Cluster {
 // client cert and validates the atunnel ingress server against the trust
 // bundle. Validation is by the SPIFFE URI SAN prefix (see upstreamSpiffePrefix)
 // rather than the dialed pod IP.
+//
+// The client cert comes through SDS (UpstreamClientCertSecretName, see
+// buildUpstreamClientCertSecret) rather than inline: Envoy reads an inline
+// filename once when the cluster is created and never again, so after kubelet
+// rotated the 24 h projected pod certificate the router kept presenting the
+// expired one and every actor handshake failed with certificate_expired.
 func (x *XdsServer) buildUpstreamTransportSocket() *corev3.TransportSocket {
 	if x.upstreamCredentialBundlePath == "" {
 		return nil
 	}
 
 	commonTls := &tlsv3.CommonTlsContext{
-		TlsCertificates: []*tlsv3.TlsCertificate{
+		TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{
 			{
-				CertificateChain: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{Filename: x.upstreamCredentialBundlePath},
-				},
-				PrivateKey: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{Filename: x.upstreamCredentialBundlePath},
+				Name: UpstreamClientCertSecretName,
+				SdsConfig: &corev3.ConfigSource{
+					ConfigSourceSpecifier: &corev3.ConfigSource_Ads{
+						Ads: &corev3.AggregatedConfigSource{},
+					},
+					ResourceApiVersion: corev3.ApiVersion_V3,
 				},
 			},
 		},
@@ -1314,27 +1327,35 @@ func (x *XdsServer) buildConnectTerminateTLSListener() *listenerv3.Listener {
 }
 
 func (x *XdsServer) buildTlsSecret() *tlsv3.Secret {
+	return credentialBundleSecret(HTTPSCertSecretName, x.certPath)
+}
+
+// buildUpstreamClientCertSecret is the podidentity client cert for the
+// ORIGINAL_DST actor cluster (see buildUpstreamTransportSocket).
+func (x *XdsServer) buildUpstreamClientCertSecret() *tlsv3.Secret {
+	return credentialBundleSecret(UpstreamClientCertSecretName, x.upstreamCredentialBundlePath)
+}
+
+// credentialBundleSecret is an SDS TlsCertificate secret backed by a projected
+// pod certificate: a single PEM bundle holding both the cert chain and the
+// private key, so both DataSources point at the same file. WatchedDirectory
+// makes Envoy re-read the file when kubelet rotates the projected volume (it
+// swaps the ..data symlink in that directory). Envoy honors WatchedDirectory
+// only on SDS-delivered TlsCertificates, never on inline ones; see
+// https://pkg.go.dev/github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3#:~:text=This%20only%20applies%20when%20a%20%E2%80%9CTlsCertificate%E2%80%9C%20is%20delivered%20by%20SDS
+func credentialBundleSecret(name, bundlePath string) *tlsv3.Secret {
 	return &tlsv3.Secret{
-		Name: HTTPSCertSecretName,
+		Name: name,
 		Type: &tlsv3.Secret_TlsCertificate{
 			TlsCertificate: &tlsv3.TlsCertificate{
-				// The pod certificate is projected as a single PEM bundle
-				// holding both the cert chain and the private key, so both
-				// DataSources point at the same file.
 				CertificateChain: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{
-						Filename: x.certPath,
-					},
+					Specifier: &corev3.DataSource_Filename{Filename: bundlePath},
 				},
 				PrivateKey: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{
-						Filename: x.certPath,
-					},
+					Specifier: &corev3.DataSource_Filename{Filename: bundlePath},
 				},
-				// By specifying WatchedDirectory, we tell envoy to watch changes to the mounted pod certificate file.
-				// See documentation in https://pkg.go.dev/github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3#:~:text=This%20only%20applies%20when%20a%20%E2%80%9CTlsCertificate%E2%80%9C%20is%20delivered%20by%20SDS
 				WatchedDirectory: &corev3.WatchedDirectory{
-					Path: filepath.Dir(x.certPath),
+					Path: filepath.Dir(bundlePath),
 				},
 			},
 		},

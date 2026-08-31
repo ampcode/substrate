@@ -338,6 +338,72 @@ func TestXdsServer_UpdateSnapshot_HttpsWithoutCertPath(t *testing.T) {
 	}
 }
 
+// TestXdsServer_UpdateSnapshot_UpstreamTls locks in that the actor cluster's
+// client cert is delivered through SDS with a watched directory. An inline
+// tls_certificates filename is read once at cluster creation, so the router
+// would keep presenting the projected pod certificate after kubelet rotated it
+// and every actor handshake would fail with certificate_expired a day later.
+func TestXdsServer_UpdateSnapshot_UpstreamTls(t *testing.T) {
+	const bundlePath = "/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+	const trustPath = "/run/podidentity.podcert.ate.dev/trust-bundle.pem"
+	server := NewXdsServer(18000)
+	server.SetConfig(8081, 50052, "10.0.0.1")
+	server.SetUpstreamTls(bundlePath, trustPath, "spiffe://substrate.ate.dev/")
+
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap := res.(*cachev3.Snapshot)
+	if err := snap.Consistent(); err != nil {
+		t.Fatalf("Integrity check failed on snapshot: %v", err)
+	}
+
+	raw, exists := snap.GetResources(resourcev3.ClusterType)[OriginalDstClusterName]
+	if !exists {
+		t.Fatalf("'%s' is missing from clusters", OriginalDstClusterName)
+	}
+	utc := &tlsv3.UpstreamTlsContext{}
+	if err := raw.(*clusterv3.Cluster).GetTransportSocket().GetTypedConfig().UnmarshalTo(utc); err != nil {
+		t.Fatalf("Failed to unmarshal UpstreamTlsContext: %v", err)
+	}
+	common := utc.GetCommonTlsContext()
+	if got := common.GetTlsCertificates(); len(got) != 0 {
+		t.Errorf("Expected no inline TlsCertificates on the actor cluster, got %d", len(got))
+	}
+	sds := common.GetTlsCertificateSdsSecretConfigs()
+	if len(sds) != 1 {
+		t.Fatalf("Expected 1 SDS secret config on the actor cluster, got %d", len(sds))
+	}
+	if sds[0].GetName() != UpstreamClientCertSecretName {
+		t.Errorf("Expected SDS secret name '%s', got '%s'", UpstreamClientCertSecretName, sds[0].GetName())
+	}
+	if sds[0].GetSdsConfig().GetAds() == nil {
+		t.Error("Expected SDS config to use the ADS config source")
+	}
+	if got := common.GetValidationContext().GetTrustedCa().GetFilename(); got != trustPath {
+		t.Errorf("Expected trusted CA filename '%s', got '%s'", trustPath, got)
+	}
+
+	secretRaw, exists := snap.GetResources(resourcev3.SecretType)[UpstreamClientCertSecretName]
+	if !exists {
+		t.Fatalf("Secret '%s' is missing from snapshot secrets", UpstreamClientCertSecretName)
+	}
+	tlsCert := secretRaw.(*tlsv3.Secret).GetTlsCertificate()
+	if got := tlsCert.GetCertificateChain().GetFilename(); got != bundlePath {
+		t.Errorf("Expected certificate chain filename '%s', got '%s'", bundlePath, got)
+	}
+	if got := tlsCert.GetPrivateKey().GetFilename(); got != bundlePath {
+		t.Errorf("Expected private key filename '%s', got '%s'", bundlePath, got)
+	}
+	if got, want := tlsCert.GetWatchedDirectory().GetPath(), filepath.Dir(bundlePath); got != want {
+		t.Errorf("Expected watched directory '%s', got '%s'", want, got)
+	}
+}
+
 // TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault locks in that the
 // CONNECT-terminating listeners/cluster are opt-in: with SetConnectPorts never
 // called (both ports default to 0), UpdateSnapshot must produce exactly the
