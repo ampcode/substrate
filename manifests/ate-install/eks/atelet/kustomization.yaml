@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# atelet for Amazon EKS: no GCP credentials for image pulls, and the S3
-# snapshot backend pointed at Amazon S3 itself. The bucket's region comes from
+# atelet for Amazon EKS: Amazon ECR credentials for image pulls (atelet pulls
+# actor and volume images itself, and private ECR has no anonymous pull; the
+# ECR credential helper uses the same IRSA role as the S3 backend, which needs
+# ecr:GetAuthorizationToken and the pull actions), no GCP credentials, and the
+# S3 snapshot backend pointed at Amazon S3 itself. The bucket's region comes from
 # the ate-aws-config ConfigMap (hack/install-ate.sh creates it from
 # ATE_AWS_REGION); the credentials come from IRSA: the installer annotates the
 # atelet ServiceAccount with eks.amazonaws.com/role-arn, and EKS's pod identity
@@ -54,6 +57,7 @@ patches:
             - name: atelet
               args:
               - --gcp-auth-for-image-pulls=false
+              - --ecr-auth-for-image-pulls=true
               - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
               - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
               - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem

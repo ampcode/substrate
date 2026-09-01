@@ -106,6 +106,11 @@ type Store struct {
 	// GCP credentials (gcr.io / pkg.dev). See remoteOpts.
 	authenticator authn.Authenticator
 
+	// keychain, when set, resolves credentials for pulls from every other
+	// registry (for example Amazon ECR); registries it has nothing for are
+	// pulled anonymously. See remoteOpts.
+	keychain authn.Keychain
+
 	localhostRegistryReplacement string
 
 	// platform overrides the default pull platform (linux/GOARCH), for
@@ -149,6 +154,12 @@ type Option func(*Store)
 // registries. A nil authenticator is ignored.
 func WithAuthenticator(a authn.Authenticator) Option {
 	return func(s *Store) { s.authenticator = a }
+}
+
+// WithKeychain attaches a keychain consulted for registries other than
+// gcr.io / pkg.dev. A nil keychain is ignored.
+func WithKeychain(k authn.Keychain) Option {
+	return func(s *Store) { s.keychain = k }
 }
 
 // WithLocalhostRegistryReplacement rewrites localhost/loopback registry refs
@@ -682,6 +693,8 @@ func (s *Store) remoteOpts(ctx context.Context, parsedRef name.Reference) []remo
 	registry := parsedRef.Context().Registry.RegistryStr()
 	if s.authenticator != nil && registryUsesGCPAuth(registry) {
 		opts = append(opts, remote.WithAuth(s.authenticator))
+	} else if s.keychain != nil {
+		opts = append(opts, remote.WithAuthFromKeychain(s.keychain))
 	}
 	return opts
 }
