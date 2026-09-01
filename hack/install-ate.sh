@@ -77,8 +77,10 @@ function usage() {
   echo "                                         or the podcert-agent sidecar, for clusters without the"
   echo "                                         certificates.k8s.io/v1beta1 API such as AKS and EKS"
   echo "  --overlay=NAME                         Install from manifests/ate-install/NAME instead of the GKE base"
-  echo "                                         (aks: in-cluster S3 snapshot store, no GCP auth; implies --pki-delivery=agent"
-  echo "                                         unless set). Not combined with kind or --atenet-router=agentgateway"
+  echo "                                         (aks: in-cluster S3 snapshot store, no GCP auth; eks: Amazon S3 with IRSA,"
+  echo "                                         needs ATE_AWS_REGION and ATE_EKS_ATELET_ROLE_ARN; both imply"
+  echo "                                         --pki-delivery=agent unless set). Not combined with kind or"
+  echo "                                         --atenet-router=agentgateway"
   echo "  --podcert-workers-per-signer N         Concurrent workers per podcertificate-controller signer (default: 1)"
   echo "  --rollout-timeout DURATION             Per-workload readiness wait timeout, kubectl-style Go duration (default: 60s)"
   echo "  --otlp-endpoint URL                    Send all control plane telemetry to URL, not to the cluster default (see benchmarking/telemetry/README.md)"
@@ -682,6 +684,8 @@ deploy_ate_system() {
     fi
   fi
 
+  annotate_atelet_service_account_for_irsa
+
   local manifests=""
   manifests="$(render_ate_system_manifests)"
   echo "${manifests}" | run_kubectl apply -f -
@@ -720,9 +724,12 @@ ensure_apiserver_prerequisites() {
   create_api_server_env_vars
   run_kubectl get configmap -n ate-system ate-api-authentication >/dev/null 2>&1 \
     || create_api_authentication_config
-  if [[ -n "$(install_overlay)" ]]; then
+  if [[ -n "$(install_overlay)" && -f "manifests/ate-install/$(install_overlay)/rustfs.yaml" ]]; then
     run_kubectl get secret -n ate-system rustfs-credentials >/dev/null 2>&1 \
       || create_rustfs_credentials_secret
+  fi
+  if [[ "$(install_overlay)" == "eks" ]]; then
+    create_aws_config
   fi
 }
 
@@ -735,6 +742,40 @@ create_rustfs_credentials_secret() {
     --from-literal=access-key="$(openssl rand -hex 16)" \
     --from-literal=secret-key="$(openssl rand -hex 32)" \
     --dry-run=client -o yaml | run_kubectl apply -f -
+}
+
+# The eks overlay's atelet reads the snapshot bucket's region from this
+# ConfigMap (manifests/ate-install/eks/atelet). Reconciled on every install so a
+# region change in ATE_AWS_REGION takes effect on the next atelet rollout.
+create_aws_config() {
+  log_step "create_aws_config"
+  if [[ -z "${ATE_AWS_REGION:-}" ]]; then
+    echo "Error: --overlay eks needs ATE_AWS_REGION (the region of the S3 snapshot bucket)" >&2
+    exit 1
+  fi
+  run_kubectl create configmap -n ate-system ate-aws-config \
+    --from-literal=region="${ATE_AWS_REGION}" \
+    --dry-run=client -o yaml | run_kubectl apply -f -
+}
+
+# IRSA for atelet on EKS: the pod identity webhook projects a web identity
+# token into pods whose ServiceAccount carries eks.amazonaws.com/role-arn, so
+# the annotation must be on the ServiceAccount before the DaemonSet's pods are
+# created. The annotation is set imperatively (not through apply) so applying
+# the plain manifest afterwards leaves it alone. A changed role needs an atelet
+# rollout restart; the installer's apply of the DaemonSet does not restart pods
+# on its own when nothing else changed.
+annotate_atelet_service_account_for_irsa() {
+  [[ "$(install_overlay)" == "eks" ]] || return 0
+  if [[ -z "${ATE_EKS_ATELET_ROLE_ARN:-}" ]]; then
+    echo "Error: --overlay eks needs ATE_EKS_ATELET_ROLE_ARN (IAM role with access to the S3 snapshot bucket)" >&2
+    exit 1
+  fi
+  log_step "annotate_atelet_service_account_for_irsa"
+  run_kubectl get serviceaccount -n ate-system atelet >/dev/null 2>&1 \
+    || run_kubectl create serviceaccount -n ate-system atelet
+  run_kubectl annotate serviceaccount -n ate-system atelet --overwrite \
+    "eks.amazonaws.com/role-arn=${ATE_EKS_ATELET_ROLE_ARN}"
 }
 
 # Redeploy only the ate-apiserver
@@ -764,6 +805,10 @@ deploy_atelet() {
 
   apply_otel_config
   apply_otel_endpoint_override
+  if [[ "$(install_overlay)" == "eks" ]]; then
+    create_aws_config
+  fi
+  annotate_atelet_service_account_for_irsa
 
   local manifest=""
   if [[ -n "$(install_overlay)" ]]; then
@@ -1174,8 +1219,8 @@ esac
 podcert_workers_per_signer >/dev/null
 rollout_timeout >/dev/null
 install_overlay >/dev/null
-# The aks overlay exists for clusters without certificates.k8s.io/v1beta1.
-if [[ "${ATE_INSTALL_OVERLAY:-}" == "aks" && -z "${ATE_PKI_DELIVERY:-}" ]]; then
+# The aks and eks overlays exist for clusters without certificates.k8s.io/v1beta1.
+if [[ ("${ATE_INSTALL_OVERLAY:-}" == "aks" || "${ATE_INSTALL_OVERLAY:-}" == "eks") && -z "${ATE_PKI_DELIVERY:-}" ]]; then
   ATE_PKI_DELIVERY=agent
 fi
 if [[ "$(pki_delivery)" == "agent" && "${ATE_EXPERIMENTAL_USE_SDSMINT:-false}" == "true" ]]; then
