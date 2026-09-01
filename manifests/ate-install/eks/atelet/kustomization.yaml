@@ -20,6 +20,12 @@
 # webhook then projects a web identity token and sets AWS_ROLE_ARN and
 # AWS_WEB_IDENTITY_TOKEN_FILE on every atelet pod, which the SDK's default
 # credential chain in cmd/atelet uses. Nothing here names the account or role.
+#
+# atelet runs only on worker nodes (those labelled ate.dev/sandboxClass, see
+# ../kustomization.yaml "Nodes"). Actors are placed on ateom worker pods, which
+# the WorkerPool schedules there, so atelet has nothing to do elsewhere; and on
+# EKS Auto Mode's Bottlerocket nodes its hostPath and device-plugin setup would
+# not work anyway.
 
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -37,6 +43,13 @@ patches:
       spec:
         template:
           spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: ate.dev/sandboxClass
+                      operator: Exists
             containers:
             - name: atelet
               args:
