@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# aks: the control plane for a cluster that is not on Google Cloud (AKS, EKS,
-# any conformant Kubernetes). It is the GKE base with three substitutions:
+# aks: the control plane for an Azure AKS cluster. It is the GKE base with the
+# Google-specific pieces swapped out:
 #
-#   - snapshots go to an in-cluster S3 store (rustfs, from the kind overlay
-#     but with a disk-backed claim sized for real snapshots) instead of GCS,
-#     and atelet pulls images without GCP credentials (./atelet);
+#   - snapshots go to Azure Blob Storage; atelet authenticates with Azure
+#     Workload Identity (the AKS webhook projects a federated token into pods
+#     labelled azure.workload.identity/use whose ServiceAccount carries the
+#     azure.workload.identity/client-id annotation, and the Azure SDK's default
+#     credential chain picks it up), so no access keys exist anywhere in the
+#     cluster. hack/install-ate.sh sets the annotation from
+#     ATE_AKS_ATELET_CLIENT_ID and the storage account from
+#     ATE_AZURE_STORAGE_ACCOUNT (ConfigMap ate-azure-config), see ./atelet;
+#   - atelet pulls images without GCP credentials (./atelet);
 #   - telemetry goes to the small in-cluster OTLP collector the kind overlay
 #     ships instead of GKE's managed collector, so components do not spend
 #     their time failing to export;
@@ -40,4 +46,3 @@ resources:
   - ../pod-certificate-controller.yaml
   - ../kind/ate-otel-config.yaml
   - ../kind/otel-collector.yaml
-  - ./rustfs.yaml

@@ -13,8 +13,7 @@
 # limitations under the License.
 
 # eks: the control plane for an Amazon EKS cluster. Like the aks overlay it is
-# the GKE base with the Google-specific pieces swapped out, but where aks ships
-# an in-cluster S3 store, EKS has the real thing:
+# the GKE base with the Google-specific pieces swapped out:
 #
 #   - snapshots go to an Amazon S3 bucket; atelet authenticates with IAM Roles
 #     for Service Accounts (the AWS SDK default credential chain picks up the

@@ -77,8 +77,9 @@ function usage() {
   echo "                                         or the podcert-agent sidecar, for clusters without the"
   echo "                                         certificates.k8s.io/v1beta1 API such as AKS and EKS"
   echo "  --overlay=NAME                         Install from manifests/ate-install/NAME instead of the GKE base"
-  echo "                                         (aks: in-cluster S3 snapshot store, no GCP auth; eks: Amazon S3 with IRSA,"
-  echo "                                         needs ATE_AWS_REGION and ATE_EKS_ATELET_ROLE_ARN; both imply"
+  echo "                                         (aks: Azure Blob snapshots with Workload Identity, needs"
+  echo "                                         ATE_AZURE_STORAGE_ACCOUNT and ATE_AKS_ATELET_CLIENT_ID; eks: Amazon S3"
+  echo "                                         with IRSA, needs ATE_AWS_REGION and ATE_EKS_ATELET_ROLE_ARN; both imply"
   echo "                                         --pki-delivery=agent unless set). Not combined with kind or"
   echo "                                         --atenet-router=agentgateway"
   echo "  --podcert-workers-per-signer N         Concurrent workers per podcertificate-controller signer (default: 1)"
@@ -685,6 +686,7 @@ deploy_ate_system() {
   fi
 
   annotate_atelet_service_account_for_irsa
+  annotate_atelet_service_account_for_workload_identity
 
   local manifests=""
   manifests="$(render_ate_system_manifests)"
@@ -724,23 +726,26 @@ ensure_apiserver_prerequisites() {
   create_api_server_env_vars
   run_kubectl get configmap -n ate-system ate-api-authentication >/dev/null 2>&1 \
     || create_api_authentication_config
-  if [[ -n "$(install_overlay)" && -f "manifests/ate-install/$(install_overlay)/rustfs.yaml" ]]; then
-    run_kubectl get secret -n ate-system rustfs-credentials >/dev/null 2>&1 \
-      || create_rustfs_credentials_secret
-  fi
   if [[ "$(install_overlay)" == "eks" ]]; then
     create_aws_config
   fi
+  if [[ "$(install_overlay)" == "aks" ]]; then
+    create_azure_config
+  fi
 }
 
-# The in-cluster S3 store of the aks overlay and atelet share these keys
-# (manifests/ate-install/aks/rustfs.yaml, aks/atelet). Created once with random
-# values and never rewritten, like the other install secrets.
-create_rustfs_credentials_secret() {
-  log_step "create_rustfs_credentials_secret"
-  run_kubectl create secret generic -n ate-system rustfs-credentials \
-    --from-literal=access-key="$(openssl rand -hex 16)" \
-    --from-literal=secret-key="$(openssl rand -hex 32)" \
+# The aks overlay's atelet reads the snapshot storage account from this
+# ConfigMap (manifests/ate-install/aks/atelet). Reconciled on every install so
+# an account change in ATE_AZURE_STORAGE_ACCOUNT takes effect on the next atelet
+# rollout.
+create_azure_config() {
+  log_step "create_azure_config"
+  if [[ -z "${ATE_AZURE_STORAGE_ACCOUNT:-}" ]]; then
+    echo "Error: --overlay aks needs ATE_AZURE_STORAGE_ACCOUNT (the storage account holding the snapshot container)" >&2
+    exit 1
+  fi
+  run_kubectl create configmap -n ate-system ate-azure-config \
+    --from-literal=storageAccount="${ATE_AZURE_STORAGE_ACCOUNT}" \
     --dry-run=client -o yaml | run_kubectl apply -f -
 }
 
@@ -778,6 +783,24 @@ annotate_atelet_service_account_for_irsa() {
     "eks.amazonaws.com/role-arn=${ATE_EKS_ATELET_ROLE_ARN}"
 }
 
+# Workload Identity for atelet on AKS: the same shape as IRSA above. The webhook
+# projects a federated token into pods labelled azure.workload.identity/use
+# whose ServiceAccount carries azure.workload.identity/client-id, so the
+# annotation must be on the ServiceAccount before the DaemonSet's pods are
+# created.
+annotate_atelet_service_account_for_workload_identity() {
+  [[ "$(install_overlay)" == "aks" ]] || return 0
+  if [[ -z "${ATE_AKS_ATELET_CLIENT_ID:-}" ]]; then
+    echo "Error: --overlay aks needs ATE_AKS_ATELET_CLIENT_ID (client ID of the managed identity with access to the snapshot container)" >&2
+    exit 1
+  fi
+  log_step "annotate_atelet_service_account_for_workload_identity"
+  run_kubectl get serviceaccount -n ate-system atelet >/dev/null 2>&1 \
+    || run_kubectl create serviceaccount -n ate-system atelet
+  run_kubectl annotate serviceaccount -n ate-system atelet --overwrite \
+    "azure.workload.identity/client-id=${ATE_AKS_ATELET_CLIENT_ID}"
+}
+
 # Redeploy only the ate-apiserver
 deploy_ate_apiserver() {
   log_step "deploy_ate_apiserver"
@@ -808,7 +831,11 @@ deploy_atelet() {
   if [[ "$(install_overlay)" == "eks" ]]; then
     create_aws_config
   fi
+  if [[ "$(install_overlay)" == "aks" ]]; then
+    create_azure_config
+  fi
   annotate_atelet_service_account_for_irsa
+  annotate_atelet_service_account_for_workload_identity
 
   local manifest=""
   if [[ -n "$(install_overlay)" ]]; then
