@@ -29,6 +29,7 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -300,9 +301,179 @@ func TestSyncer_SoftDelete_NoPodIP(t *testing.T) {
 	}
 }
 
-// TestMarkWorkerDraining verifies markWorkerDraining's return contract: nil
-// when the work is already done (the record is gone, or is already draining)
-// and nil after a successful ACTIVE->DRAINING transition, which it persists.
+// boundWorker is a registered worker hosting actor, as the registry reports a
+// worker the scheduler has placed an actor on.
+func boundWorker(ns, poolName, podName, uid, ip string, actor *ateapipb.ObjectRef) *ateapipb.Worker {
+	w := registeredWorker(ns, poolName, podName, uid, ip)
+	w.Status = &ateapipb.WorkerStatus{
+		State:      ateapipb.WorkerState_WORKER_STATE_ACTIVE,
+		Assignment: &ateapipb.ActorAssignment{Actor: actor, ActorUid: "actor-uid-1"},
+	}
+	return w
+}
+
+// waitForSuspends polls until api has seen n SuspendActor calls.
+func waitForSuspends(t *testing.T, api *fakeControl, n int) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(context.Background(), 10*time.Millisecond, 5*time.Second, true, func(context.Context) (bool, error) {
+		return len(api.suspendCalls()) >= n, nil
+	})
+	if err != nil {
+		t.Fatalf("waiting for %d SuspendActor calls: %v (got %d)", n, err, len(api.suspendCalls()))
+	}
+}
+
+// waitForSuspendDone polls until the syncer no longer has a suspend in flight
+// for key.
+func waitForSuspendDone(t *testing.T, s *WorkerPoolSyncer, key workerKey) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(context.Background(), 10*time.Millisecond, 5*time.Second, true, func(context.Context) (bool, error) {
+		return !s.suspendInFlight(key), nil
+	})
+	if err != nil {
+		t.Fatalf("waiting for suspend of %+v to finish: %v", key, err)
+	}
+}
+
+// TestSyncer_SoftDelete_SuspendsBoundActor covers the whole drain of a worker
+// that hosts an actor: the Terminating pod gets the actor suspended, exactly
+// once however many pod events re-drive the reconcile, and the worker record is
+// deregistered only after that suspend has finished.
+func TestSyncer_SoftDelete_SuspendsBoundActor(t *testing.T) {
+	ctx := context.Background()
+	ns, poolName, podName, ip := "ns-drain-bound", "pool1", "worker-drain-bound", "10.0.0.5"
+	actor := &ateapipb.ObjectRef{Atespace: "space", Name: "actor-1"}
+
+	api := newFakeControl()
+	api.put(boundWorker(ns, poolName, podName, testPodUID, ip, actor))
+	// Hold every suspend until released, so the test can observe the in-flight
+	// window.
+	release := make(chan struct{})
+	api.setSuspendHook(func(*ateapipb.ObjectRef) error {
+		<-release
+		return nil
+	})
+	s, pods, _ := setupReconcileTest(t, api)
+
+	pod := workerPod(ns, podName, poolName, testPodUID, ip)
+	pod.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
+	key := seedPod(t, pods, pod)
+	mustReconcile(t, ctx, s, key)
+	mustReconcile(t, ctx, s, key)
+	mustReconcile(t, ctx, s, key)
+
+	waitForSuspends(t, api, 1)
+	if calls := api.suspendCalls(); len(calls) != 1 || !proto.Equal(calls[0], actor) {
+		t.Fatalf("SuspendActor calls = %v, want exactly one for %v", calls, actor)
+	}
+	if got := api.get(testPodUID).GetStatus().GetState(); got != ateapipb.WorkerState_WORKER_STATE_DRAINING {
+		t.Errorf("worker state = %v, want DRAINING", got)
+	}
+
+	// The pod goes away while the suspend is still running: the record must
+	// stay, or DeleteWorker would crash the SUSPENDING actor.
+	if err := pods.Delete(pod); err != nil {
+		t.Fatalf("removing pod from cache: %v", err)
+	}
+	mustReconcile(t, ctx, s, key)
+	if api.get(testPodUID) == nil {
+		t.Fatal("worker deregistered while its actor's suspend was in flight")
+	}
+
+	close(release)
+	waitForSuspendDone(t, s, key)
+
+	// Completion re-enqueues the key; the reconcile it drives deletes the record.
+	got, quit := s.queue.Get()
+	if quit || got != key {
+		t.Fatalf("queue.Get() = %+v, %v, want %+v re-enqueued", got, quit, key)
+	}
+	s.queue.Done(got)
+	mustReconcile(t, ctx, s, key)
+	if api.get(testPodUID) != nil {
+		t.Error("worker still registered after its actor's suspend finished")
+	}
+}
+
+// TestSyncer_SoftDelete_NoBoundActor pins that a draining worker without an
+// actor issues no SuspendActor and is deregistered as soon as its pod is gone.
+func TestSyncer_SoftDelete_NoBoundActor(t *testing.T) {
+	ctx := context.Background()
+	ns, poolName, podName, ip := "ns-drain-idle", "pool1", "worker-drain-idle", "10.0.0.6"
+
+	api := newFakeControl()
+	api.put(registeredWorker(ns, poolName, podName, testPodUID, ip))
+	s, pods, _ := setupReconcileTest(t, api)
+
+	pod := workerPod(ns, podName, poolName, testPodUID, ip)
+	pod.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
+	key := seedPod(t, pods, pod)
+	mustReconcile(t, ctx, s, key)
+
+	if calls := api.suspendCalls(); len(calls) != 0 {
+		t.Errorf("SuspendActor calls = %v, want none for an idle worker", calls)
+	}
+	if err := pods.Delete(pod); err != nil {
+		t.Fatalf("removing pod from cache: %v", err)
+	}
+	mustReconcile(t, ctx, s, key)
+	if api.get(testPodUID) != nil {
+		t.Error("idle worker still registered after its pod was gone")
+	}
+}
+
+// TestSuspendActor_Codes pins how suspendActor reads each gRPC code: ABORTED and
+// transport failures are retried until the call goes through, while
+// FAILED_PRECONDITION and NOT_FOUND end the attempt.
+func TestSuspendActor_Codes(t *testing.T) {
+	ctx := context.Background()
+	key := workerKey{namespace: "ns-codes", name: "worker-codes", uid: testPodUID}
+	actor := &ateapipb.ObjectRef{Atespace: "space", Name: "actor-codes"}
+
+	saved := drainSuspendRetryInterval
+	drainSuspendRetryInterval = time.Millisecond
+	t.Cleanup(func() { drainSuspendRetryInterval = saved })
+
+	t.Run("aborted and unavailable are retried until OK", func(t *testing.T) {
+		api := newFakeControl()
+		answers := []error{
+			status.Error(codes.Aborted, "lease held"),
+			status.Error(codes.Unavailable, "api restarting"),
+			nil,
+		}
+		api.setSuspendHook(func(*ateapipb.ObjectRef) error {
+			err := answers[0]
+			answers = answers[1:]
+			return err
+		})
+
+		s := &WorkerPoolSyncer{client: api}
+		s.suspendActor(ctx, key, actor)
+		if got := len(api.suspendCalls()); got != 3 {
+			t.Errorf("SuspendActor calls = %d, want 3 (two retries then success)", got)
+		}
+	})
+
+	for _, code := range []codes.Code{codes.FailedPrecondition, codes.NotFound} {
+		t.Run(code.String()+" ends the attempt", func(t *testing.T) {
+			api := newFakeControl()
+			api.setSuspendHook(func(*ateapipb.ObjectRef) error {
+				return status.Error(code, "cannot suspend")
+			})
+
+			s := &WorkerPoolSyncer{client: api}
+			s.suspendActor(ctx, key, actor)
+			if got := len(api.suspendCalls()); got != 1 {
+				t.Errorf("SuspendActor calls = %d, want 1 (no retry)", got)
+			}
+		})
+	}
+}
+
+// TestMarkWorkerDraining verifies markWorkerDraining's return contract: a nil
+// worker when the record is gone, and the drained record otherwise, whether it
+// was already draining or this call made the ACTIVE->DRAINING transition, which
+// it persists.
 func TestMarkWorkerDraining(t *testing.T) {
 	ctx := context.Background()
 	ns, poolName, podName := "ns-mark", "pool1", "worker-mark"
@@ -310,8 +481,12 @@ func TestMarkWorkerDraining(t *testing.T) {
 
 	t.Run("worker not found returns nil", func(t *testing.T) {
 		s := &WorkerPoolSyncer{client: newFakeControl()}
-		if err := s.markWorkerDraining(ctx, key); err != nil {
+		w, err := s.markWorkerDraining(ctx, key)
+		if err != nil {
 			t.Errorf("markWorkerDraining on missing worker = %v, want nil", err)
+		}
+		if w != nil {
+			t.Errorf("markWorkerDraining on missing worker returned %v, want nil worker", w)
 		}
 	})
 
@@ -322,8 +497,12 @@ func TestMarkWorkerDraining(t *testing.T) {
 		seeded := api.put(w)
 
 		s := &WorkerPoolSyncer{client: api}
-		if err := s.markWorkerDraining(ctx, key); err != nil {
+		w, err := s.markWorkerDraining(ctx, key)
+		if err != nil {
 			t.Errorf("markWorkerDraining on already-draining worker = %v, want nil", err)
+		}
+		if got := w.GetStatus().GetState(); got != ateapipb.WorkerState_WORKER_STATE_DRAINING {
+			t.Errorf("returned worker state = %v, want DRAINING", got)
 		}
 		// Every pod event on a Terminating pod re-drives the drain, so a repeat
 		// must not churn the version.
@@ -337,8 +516,12 @@ func TestMarkWorkerDraining(t *testing.T) {
 		api.put(registeredWorker(ns, poolName, podName, testPodUID, "10.0.0.4"))
 
 		s := &WorkerPoolSyncer{client: api}
-		if err := s.markWorkerDraining(ctx, key); err != nil {
+		w, err := s.markWorkerDraining(ctx, key)
+		if err != nil {
 			t.Fatalf("markWorkerDraining = %v, want nil", err)
+		}
+		if got := w.GetStatus().GetState(); got != ateapipb.WorkerState_WORKER_STATE_DRAINING {
+			t.Errorf("returned worker state = %v, want DRAINING", got)
 		}
 		if got := api.get(testPodUID).GetStatus().GetState(); got != ateapipb.WorkerState_WORKER_STATE_DRAINING {
 			t.Errorf("worker state = %v, want DRAINING", got)

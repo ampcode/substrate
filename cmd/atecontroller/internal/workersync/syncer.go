@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"sync"
 	"time"
 
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
@@ -42,6 +43,19 @@ const syncerWorkerCount = 2
 // also what marks a pod as a worker pod at all, so it doubles as the selector
 // the pod informer is narrowed by.
 const workerPodLabel = "ate.dev/worker-pool"
+
+// drainSuspendTimeout bounds the suspend of an actor whose worker pod is
+// Terminating, from the first SuspendActor call to the actor being SUSPENDED.
+// It covers the checkpoint inside the pod, which ateom-gvisor waits up to 10 min
+// for before it stops the sandbox anyway (checkpointGracePeriod there), and
+// atelet's upload of the snapshot after it. Both fit in the 3600 s termination
+// grace period the WorkerPool controller gives worker pods.
+const drainSuspendTimeout = 20 * time.Minute
+
+// drainSuspendRetryInterval is the pause between SuspendActor attempts while
+// another operation holds the actor or the API is unavailable. A variable so
+// tests can shorten it.
+var drainSuspendRetryInterval = 5 * time.Second
 
 // workerKey identifies the pod incarnation a queued event concerns. namespace
 // and name locate the pod in the informer, which is indexed by namespace/name
@@ -94,6 +108,11 @@ type WorkerPoolSyncer struct {
 	workerInformer   cache.SharedIndexInformer
 	workerPoolLister listersv1alpha1.WorkerPoolLister
 	queue            workqueue.TypedRateLimitingInterface[workerKey]
+
+	// suspends holds the workers whose bound actor is being suspended because
+	// their pod is Terminating. See suspendBoundActor.
+	suspendsMu sync.Mutex
+	suspends   map[workerKey]struct{}
 }
 
 // NewWorkerPoolSyncer creates a new WorkerPoolSyncer.
@@ -103,6 +122,7 @@ func NewWorkerPoolSyncer(client ateapipb.ControlClient, workerInformer cache.Sha
 		workerInformer:   workerInformer,
 		workerPoolLister: workerPoolLister,
 		queue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[workerKey]()),
+		suspends:         map[workerKey]struct{}{},
 	}
 }
 
@@ -230,11 +250,17 @@ func (s *WorkerPoolSyncer) reconcile(ctx context.Context, key workerKey) error {
 	// transition and leave the worker schedulable for as long as the pod lingers.
 	if pod.DeletionTimestamp != nil {
 		// The pod has entered Terminating: mark the worker DRAINING so the
-		// scheduler stops routing new actors to it. We deliberately do NOT touch
-		// the bound actor here — inside the pod ateom has received SIGTERM and is
-		// gracefully shutting the actor down. Actor cleanup happens on the Pod
-		// Deleted event.
-		return s.markWorkerDraining(ctx, key)
+		// scheduler stops routing new actors to it, then suspend the actor it
+		// hosts. Inside the pod ateom has received SIGTERM and holds the sandbox
+		// for the checkpoint this suspend produces; without it the actor is
+		// killed with the pod and ends CRASHED. The worker record itself is
+		// cleaned up on the Pod Deleted event, once the suspend has finished.
+		worker, err := s.markWorkerDraining(ctx, key)
+		if err != nil || worker == nil {
+			return err
+		}
+		s.suspendBoundActor(ctx, key, worker)
+		return nil
 	}
 	if !isWorkerEligible(pod) {
 		// The pod has no IP or is not Ready yet; a later update event re-enqueues it.
@@ -360,18 +386,97 @@ func workerCapacity(pod *corev1.Pod) *ateapipb.WorkerCapacity {
 }
 
 // markWorkerDraining transitions a worker to STATE_DRAINING so the scheduler
-// stops routing new actors to it while its pod is Terminating. DrainWorker is
+// stops routing new actors to it while its pod is Terminating, and returns the
+// record as drained, with the actor still bound to it. DrainWorker is
 // idempotent, so a worker already draining costs nothing. If the worker is
 // already gone there is nothing more to do — the Pod Deleted event will clean up
-// the record. A version conflict comes back as ABORTED so the caller requeues
-// and retries against the updated record.
-func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey) error {
+// the record — and nil is returned. A version conflict comes back as ABORTED so
+// the caller requeues and retries against the updated record.
+func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey) (*ateapipb.Worker, error) {
 	slog.InfoContext(ctx, "Syncer: marking worker draining (pod deleting)", key.logAttrs()...)
-	_, err := s.client.DrainWorker(ctx, &ateapipb.DrainWorkerRequest{Worker: key.workerRef()})
+	worker, err := s.client.DrainWorker(ctx, &ateapipb.DrainWorkerRequest{Worker: key.workerRef()})
 	if status.Code(err) == codes.NotFound {
-		return nil
+		return nil, nil
 	}
-	return err
+	return worker, err
+}
+
+// suspendBoundActor starts suspending the actor a draining worker hosts, so the
+// actor's state is checkpointed before the pod goes away. The suspend runs in
+// the background: it takes minutes for a large sandbox and must not hold up the
+// queue. One suspend per worker: every further reconcile of the Terminating pod
+// finds it in flight and does nothing. Its completion re-enqueues the key so the
+// worker record is deleted only after the actor is SUSPENDED (or the suspend
+// has failed); reconcileDeadWorker holds off until then.
+func (s *WorkerPoolSyncer) suspendBoundActor(ctx context.Context, key workerKey, worker *ateapipb.Worker) {
+	actor := worker.GetStatus().GetAssignment().GetActor()
+	if actor == nil {
+		return
+	}
+	s.suspendsMu.Lock()
+	defer s.suspendsMu.Unlock()
+	if _, inFlight := s.suspends[key]; inFlight {
+		return
+	}
+	s.suspends[key] = struct{}{}
+
+	go func() {
+		s.suspendActor(ctx, key, actor)
+		s.suspendsMu.Lock()
+		delete(s.suspends, key)
+		s.suspendsMu.Unlock()
+		s.queue.Add(key)
+	}()
+}
+
+// suspendActor drives one SuspendActor call to a conclusion within
+// drainSuspendTimeout. ABORTED means another operation holds the actor's lease
+// (a resume still landing, or a suspend the actor's owner issued); it is retried
+// until that operation is done, since the actor still needs suspending unless
+// the other operation did it. FAILED_PRECONDITION means the actor is in a state
+// that cannot be suspended, and NOT_FOUND that it is gone: nothing more to do.
+// Anything else is transient and retried.
+func (s *WorkerPoolSyncer) suspendActor(ctx context.Context, key workerKey, actor *ateapipb.ObjectRef) {
+	ctx, cancel := context.WithTimeout(ctx, drainSuspendTimeout)
+	defer cancel()
+	attrs := append(key.logAttrs(), slog.String("actor", actor.GetAtespace()+"/"+actor.GetName()))
+	started := time.Now()
+	slog.InfoContext(ctx, "Syncer: suspending actor on draining worker", attrs...)
+
+	for {
+		_, err := s.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actor})
+		switch status.Code(err) {
+		case codes.OK:
+			slog.InfoContext(ctx, "Syncer: actor suspended before its worker went away",
+				append(attrs, slog.Duration("took", time.Since(started)))...)
+			return
+		case codes.NotFound, codes.FailedPrecondition:
+			slog.InfoContext(ctx, "Syncer: actor on draining worker cannot be suspended, leaving it",
+				append(attrs, slog.Any("err", err))...)
+			return
+		case codes.Aborted:
+			slog.InfoContext(ctx, "Syncer: another operation holds the actor on the draining worker; retrying",
+				attrs...)
+		default:
+			slog.WarnContext(ctx, "Syncer: suspending actor on draining worker failed; retrying",
+				append(attrs, slog.Any("err", err))...)
+		}
+		select {
+		case <-ctx.Done():
+			slog.ErrorContext(ctx, "Syncer: gave up suspending actor on draining worker; it will crash with the pod",
+				append(attrs, slog.Duration("took", time.Since(started)))...)
+			return
+		case <-time.After(drainSuspendRetryInterval):
+		}
+	}
+}
+
+// suspendInFlight reports whether suspendBoundActor is still working on key.
+func (s *WorkerPoolSyncer) suspendInFlight(key workerKey) bool {
+	s.suspendsMu.Lock()
+	defer s.suspendsMu.Unlock()
+	_, inFlight := s.suspends[key]
+	return inFlight
 }
 
 // reconcileDeadWorker cleans up a worker whose pod is gone. DeleteWorker
@@ -379,10 +484,19 @@ func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey
 // release fails, so a failure here leaves the record in place (and returns the
 // error) for a later reconcile to retry.
 //
+// While the suspend started for this worker is still running, the delete waits:
+// DeleteWorker would find the actor SUSPENDING and crash it, discarding the
+// snapshot atelet is still uploading. The pod is gone by now, so nothing is
+// scheduled here in the meantime; the suspend re-enqueues the key when done.
+//
 // A worker already gone is exactly the state this is driving towards, so
 // NOT_FOUND is success. Idempotency lives here, at the caller, so re-driving a
 // reconcile is safe.
 func (s *WorkerPoolSyncer) reconcileDeadWorker(ctx context.Context, key workerKey) error {
+	if s.suspendInFlight(key) {
+		slog.InfoContext(ctx, "Syncer: worker pod gone; waiting for its actor's suspend before deregistering", key.logAttrs()...)
+		return nil
+	}
 	_, err := s.client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: key.workerRef()})
 	if status.Code(err) == codes.NotFound {
 		return nil

@@ -16,6 +16,7 @@ package demo
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -25,16 +26,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestGracefulWorkerTermination exercises the propagated-SIGTERM eviction flow
-// end to end: an actor is scheduled onto a worker pod, that pod is deleted
-// (simulating a Kubernetes eviction), and the control plane is expected to mark
-// the worker DRAINING, then remove it and detach the actor once the pod is gone.
+// TestGracefulWorkerTermination exercises the worker eviction flow end to end:
+// an actor is scheduled onto a worker pod, that pod is deleted (simulating a
+// Kubernetes eviction), and the control plane is expected to mark the worker
+// DRAINING, suspend the actor it hosts, then remove the worker and detach the
+// actor once the pod is gone.
 //
-// The demo counter actor installs a SIGTERM handler that sleeps
-// before exiting, simulating a real-world workload that waits for graceful
-// termination. The actor eventually lands in a terminal, non-RUNNING state
-// (CRASHED). We assert the control-plane state
-// machine rather than any in-actor state saving, which is the application's responsibility.
+// On gVisor the actor ends SUSPENDED: ateom-gvisor holds the sandbox after
+// SIGTERM until atecontroller's SuspendActor has checkpointed it. ateom-microvm
+// still forwards SIGTERM into the guest at once, so there the suspend races the
+// demo actor's SIGTERM handler (which sleeps before exiting) and the actor ends
+// SUSPENDED or CRASHED. We assert the control-plane state machine rather than
+// any in-actor state saving, which is the application's responsibility.
 func TestGracefulWorkerTermination(t *testing.T) {
 	nsObj := e2e.CreateNamespace(t)
 
@@ -87,20 +90,20 @@ func TestGracefulWorkerTermination(t *testing.T) {
 	}
 	t.Logf("Actor %q bound to worker pod %s/%s", actorID, podNS, podName)
 
-	// Evict the worker pod. The kubelet sends SIGTERM to ateom, which propagates
-	// it into the sandbox; the control plane marks the worker DRAINING on the
-	// DeletionTimestamp watch event and cleans up when the pod is finally gone.
+	// Evict the worker pod. The kubelet sends SIGTERM to ateom; the control
+	// plane marks the worker DRAINING on the DeletionTimestamp watch event,
+	// suspends the actor, and cleans up the worker when the pod is finally gone.
 	if err := clients.K8s.CoreV1().Pods(podNS).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed to delete worker pod %s/%s: %v", podNS, podName, err)
 	}
 
-	// The worker record must eventually be removed once the pod is gone.
-	if err := waitForWorkerRemoved(ctx, t, clients, podName, 60*time.Second); err != nil {
+	// The worker record must eventually be removed once the pod is gone, which
+	// waits for the checkpoint and its upload.
+	if err := waitForWorkerRemoved(ctx, t, clients, podName, 180*time.Second); err != nil {
 		t.Fatalf("worker %s not removed after pod deletion: %v", podName, err)
 	}
 
-	// Verify the actor lands in ACTOR_STATE_CRASHED.
-	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_CRASHED)
+	waitForActorOffWorker(ctx, t, clients, actorID, 60*time.Second)
 
 	// Verify the pod assignment was cleared.
 	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
@@ -112,6 +115,30 @@ func TestGracefulWorkerTermination(t *testing.T) {
 	if pod := actor.GetStatus().GetWorkerAssignment().GetWorkerPod(); pod != "" {
 		t.Errorf("actor still bound to worker pod %q, expected empty", pod)
 	}
+}
+
+// waitForActorOffWorker waits for an evicted actor to settle: SUSPENDED where
+// the runtime holds the sandbox for the checkpoint (gVisor), SUSPENDED or CRASHED
+// where the checkpoint races SIGTERM into the guest (microvm).
+func waitForActorOffWorker(ctx context.Context, t *testing.T, clients *e2e.Clients, actorID string, timeout time.Duration) {
+	t.Helper()
+	settled := []ateapipb.ActorState{ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
+	if e2e.IsMicroVM() {
+		settled = append(settled, ateapipb.ActorState_ACTOR_STATE_CRASHED)
+	}
+	t.Logf("Waiting for Actor %q to be one of %v...", actorID, settled)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
+			Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
+		})
+		if err == nil && slices.Contains(settled, resp.GetStatus().GetState()) {
+			t.Logf("Actor %q reached state %v", actorID, resp.GetStatus().GetState())
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("timed out waiting for actor %q to reach one of %v", actorID, settled)
 }
 
 // waitForWorkerRemoved polls ListWorkers until the named worker is absent.
@@ -140,9 +167,12 @@ func waitForWorkerRemoved(ctx context.Context, t *testing.T, clients *e2e.Client
 }
 
 // TestGracefulWorkerTerminationTimeout exercises the case where the workload
-// container hangs (exceeds the 1-minute workloadGracePeriod) during SIGTERM.
-// The ateom is expected to SIGKILL the container, letting the control plane
-// mark the worker removed and the actor CRASHED. Runs against both runtimes.
+// container hangs on SIGTERM for longer than the 1-minute workloadGracePeriod.
+// On gVisor SIGTERM never reaches the guest: the checkpoint atecontroller
+// requests lands first and the actor ends SUSPENDED. On microvm the ateom is
+// expected to SIGKILL the container unless the checkpoint beat it, and the
+// actor ends CRASHED or SUSPENDED. Either way the control plane must remove
+// the worker and detach the actor. Runs against both runtimes.
 func TestGracefulWorkerTerminationTimeout(t *testing.T) {
 	nsObj := e2e.CreateNamespace(t)
 
@@ -202,15 +232,14 @@ func TestGracefulWorkerTerminationTimeout(t *testing.T) {
 		t.Fatalf("failed to delete worker pod %s/%s: %v", podNS, podName, err)
 	}
 
-	// The worker record must eventually be removed once the pod is gone.
-	// Since there is a 1-minute timeout + up to 5s SIGKILL wait, we need a
-	// larger timeout (e.g. 120 seconds).
-	if err := waitForWorkerRemoved(ctx, t, clients, podName, 120*time.Second); err != nil {
+	// The worker record must eventually be removed once the pod is gone. On
+	// microvm that is the 1-minute timeout plus up to 5s SIGKILL wait; on gVisor
+	// it is the checkpoint and its upload.
+	if err := waitForWorkerRemoved(ctx, t, clients, podName, 180*time.Second); err != nil {
 		t.Fatalf("worker %s not removed after pod deletion: %v", podName, err)
 	}
 
-	// Verify the actor lands in ACTOR_STATE_CRASHED.
-	waitForActorStateWithTimeout(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_CRASHED, 120*time.Second)
+	waitForActorOffWorker(ctx, t, clients, actorID, 120*time.Second)
 
 	// Verify the pod assignment was cleared.
 	actor, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{

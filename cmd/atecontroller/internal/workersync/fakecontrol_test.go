@@ -60,6 +60,12 @@ type fakeControl struct {
 	// listPageSize overrides the requested page size when positive, so a
 	// handful of workers can be made to span several pages.
 	listPageSize int
+
+	// suspendHook, when set, decides SuspendActor's outcome for each call;
+	// without it every suspend succeeds. suspends records every actor a
+	// SuspendActor was issued for, in order.
+	suspendHook func(*ateapipb.ObjectRef) error
+	suspends    []*ateapipb.ObjectRef
 }
 
 func newFakeControl() *fakeControl {
@@ -134,6 +140,38 @@ func (f *fakeControl) takeUpdateHook() func(string) {
 	hook := f.updateHook
 	f.updateHook = nil
 	return hook
+}
+
+func (f *fakeControl) setSuspendHook(hook func(*ateapipb.ObjectRef) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suspendHook = hook
+}
+
+// suspendCalls returns the actors SuspendActor was called for so far.
+func (f *fakeControl) suspendCalls() []*ateapipb.ObjectRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.suspends)
+}
+
+// SuspendActor is the one Actor RPC the syncer uses, to checkpoint the actor a
+// Terminating worker pod hosts. The fake only records the call and answers as
+// the hook says; the actor state machine behind the real one is the server's.
+func (f *fakeControl) SuspendActor(_ context.Context, in *ateapipb.SuspendActorRequest, _ ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
+	f.mu.Lock()
+	f.suspends = append(f.suspends, in.GetActor())
+	hook := f.suspendHook
+	f.mu.Unlock()
+
+	// Outside the lock: a hook may block to hold the suspend in flight while
+	// the test inspects the fake.
+	if hook != nil {
+		if err := hook(in.GetActor()); err != nil {
+			return nil, err
+		}
+	}
+	return &ateapipb.SuspendActorResponse{}, nil
 }
 
 func (f *fakeControl) GetWorker(_ context.Context, in *ateapipb.GetWorkerRequest, _ ...grpc.CallOption) (*ateapipb.Worker, error) {

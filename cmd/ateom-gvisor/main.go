@@ -92,6 +92,19 @@ const actorHTTPUpstream = "http://" + ateomnet.ActorVethIP + ":80"
 // termination grace period for the ateom.
 const workloadGracePeriod = 1 * time.Minute
 
+// checkpointGracePeriod is how long a running actor is kept alive after SIGTERM for the control
+// plane to checkpoint it. atecontroller's workersync issues SuspendActor as soon as it sees the
+// worker pod Terminating; the checkpoint then arrives here as CheckpointWorkload, which is allowed
+// while draining. Only when no checkpoint has cleared the session by this deadline does shutdown
+// fall back to SIGTERM into the sandbox, which loses the actor's state (it ends CRASHED). Sized
+// for a multi-GiB checkpoint on a loaded node, and well inside the 3600 s pod termination grace
+// period atecontroller gives worker pods.
+const checkpointGracePeriod = 10 * time.Minute
+
+// checkpointPollInterval is how often gracefulShutdown re-checks for the session to be cleared
+// while waiting for the checkpoint to arrive.
+const checkpointPollInterval = time.Second
+
 func main() {
 	pflag.Parse()
 	if *showVersion {
@@ -472,29 +485,25 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 	// a SIGTERM.
 	s.cancelActiveRestoreOrRunRPC()
 
-	// Attempt to acquire the lock used to serialize ateom RPCs. This will wait for any
-	// pending RPCs to finish (suspend, resume, etc...). After the RPCs finish there
-	// should be no active session. The run / resume was cancelled and the
-	// checkpoint / restore will stop the workload and clear the active session.
-	//
-	// In the worst case, these RPCs take almost the entire grace period and then
-	// fail. We will then proceed to send SIGTERM to the containers and wait for
-	// them to exit, potentially waiting for 2x the total grace period.
-	lockCtx, lockCancel := context.WithTimeout(ctx, workloadGracePeriod)
-	defer lockCancel()
-
-	if !s.lock.LockContext(lockCtx) {
-		slog.ErrorContext(ctx, "Failed to acquire lock during graceful shutdown. Another RPC is still running ")
+	// A running workload is not stopped right away. The control plane checkpoints it first:
+	// atecontroller's workersync sees the pod Terminating and issues SuspendActor, which reaches
+	// this process as CheckpointWorkload (allowed while draining) and clears the session. The
+	// actor then resumes on another worker with its state instead of ending CRASHED. Only a
+	// workload nobody checkpointed within checkpointGracePeriod is stopped with SIGTERM.
+	waitStart := time.Now()
+	session, err := s.awaitCheckpoint(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "Leaving the workload to the RPC still running at shutdown",
+			slog.Duration("waited", time.Since(waitStart)), slog.Any("err", err))
 		return
 	}
-	session := s.activeSession
-	// Release the lock so that AteomService and respond to new RPCs.
-	s.lock.Unlock()
-
 	if session == nil {
-		slog.InfoContext(ctx, "No active workload at shutdown; exiting cleanly")
+		slog.InfoContext(ctx, "No active workload at shutdown; exiting cleanly",
+			slog.Duration("waited", time.Since(waitStart)))
 		return
 	}
+	slog.WarnContext(ctx, "No checkpoint arrived within the grace period; stopping the workload",
+		slog.Duration("waited", time.Since(waitStart)))
 
 	var wg sync.WaitGroup
 	for _, name := range session.containers {
@@ -509,6 +518,44 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 	wg.Wait()
 
 	slog.InfoContext(ctx, "Shutting down")
+}
+
+// awaitCheckpoint returns nil once the workload session is cleared: at once when the worker is
+// idle, otherwise when the control plane's CheckpointWorkload (or TerminateWorkload) finishes. It
+// returns the session still active when checkpointGracePeriod passes without that, for the
+// caller to stop. An RPC that holds the lock past the deadline, plus workloadGracePeriod for it
+// to finish, is an error: the RPC owns the sandbox and nothing else may touch it.
+//
+// The lock is taken only to read the session, and released between polls so a suspend can land
+// while this waits. A checkpoint in flight holds the lock for as long as runsc takes, so the
+// wait for it doubles as the wait for its result.
+func (s *AteomService) awaitCheckpoint(ctx context.Context) (*workloadSession, error) {
+	deadline := time.Now().Add(checkpointGracePeriod)
+	lockCtx, lockCancel := context.WithDeadline(ctx, deadline.Add(workloadGracePeriod))
+	defer lockCancel()
+
+	logged := false
+	for {
+		if !s.lock.LockContext(lockCtx) {
+			return nil, errors.New("another RPC is still running")
+		}
+		session := s.activeSession
+		s.lock.Unlock()
+
+		if session == nil || time.Now().After(deadline) {
+			return session, nil
+		}
+		if !logged {
+			slog.InfoContext(ctx, "Active workload at shutdown; waiting for the control plane to checkpoint it",
+				slog.Duration("timeout", checkpointGracePeriod))
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			return session, nil
+		case <-time.After(checkpointPollInterval):
+		}
+	}
 }
 
 // killContainer stops a container by sending SIGTERM, waiting for the grace period,
