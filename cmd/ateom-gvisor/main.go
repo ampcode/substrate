@@ -797,21 +797,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while creating checkpoint directory: %w", err)
 	}
 
-	// Always take durable-dir snapshot if at least one container has a durable-dir volume mount.
-	// TODO(dberkov): this is a temporary workaround until gVisor supports taking durable-dir snapshots in a single request with the process snapshot.
 	switch req.GetScope() {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
-		var ddv []string
-		for _, ctr := range req.GetSpec().GetContainers() {
-			for _, m := range ctr.GetDurableDirVolumeMounts() {
-				ddv = append(ddv, m.GetMountPath())
-			}
-		}
-		if len(ddv) == 0 {
-			return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
-		}
+		// A filesystem checkpoint of the whole sandbox: the rootfs delta of
+		// every container plus any durable-dir volumes. The pause container
+		// is the root of the sandbox, so one command covers all containers.
+		ddv := durableDirMountPaths(req.GetSpec())
 		if err := rcmd.cmdFsCheckpoint(ctx, "pause", checkpointPath, ddv); err != nil {
-			return nil, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err)
+			return nil, fmt.Errorf("while fscheckpointing the sandbox filesystem: %w", err)
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 		// Checkpoint pause container (root of the sandbox)

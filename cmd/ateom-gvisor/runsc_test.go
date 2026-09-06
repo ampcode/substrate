@@ -20,9 +20,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 )
 
 // TestNvproxyGlobalArgs checks that runsc is told to enable nvproxy exactly when the
@@ -85,5 +87,78 @@ func TestWaitArgs(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("waitArgs() = %v, want %v", got, want)
+	}
+}
+
+// TestFsCheckpointArgs checks that a filesystem checkpoint always saves the
+// rootfs delta of every container ("-path /"), with durable-dir volumes added
+// after it and the container name last.
+func TestFsCheckpointArgs(t *testing.T) {
+	r := &runsc{
+		path:     "/usr/bin/runsc",
+		actorUID: "test-actor-123",
+	}
+	prefix := []string{
+		"-log-format", "json",
+		"--alsologtostderr",
+		"-root", ateompath.RunSCStateDir("test-actor-123"),
+		"fscheckpoint",
+		"-image-path", "/ckpt",
+		"-path", "/",
+	}
+
+	tests := []struct {
+		name        string
+		durableDirs []string
+		want        []string
+	}{
+		{
+			name: "no durable dirs",
+			want: append(slices.Clone(prefix), "pause"),
+		},
+		{
+			name:        "durable dirs",
+			durableDirs: []string{"/data", "/scratch"},
+			want:        append(slices.Clone(prefix), "-path", "/data", "-path", "/scratch", "pause"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.fsCheckpointArgs("pause", "/ckpt", tc.durableDirs)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("fsCheckpointArgs() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurableDirMountPaths(t *testing.T) {
+	spec := &ateompb.WorkloadSpec{
+		Containers: []*ateompb.Container{
+			{
+				Name: "app",
+				DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
+					{VolumeName: "data", MountPath: "/data"},
+					{VolumeName: "scratch", MountPath: "/scratch"},
+				},
+			},
+			{
+				Name: "sidecar",
+				DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
+					{VolumeName: "data", MountPath: "/data"},
+				},
+			},
+			{Name: "plain"},
+		},
+	}
+
+	got := durableDirMountPaths(spec)
+	want := []string{"/data", "/scratch"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("durableDirMountPaths() = %v, want %v", got, want)
+	}
+
+	if got := durableDirMountPaths(&ateompb.WorkloadSpec{Containers: []*ateompb.Container{{Name: "plain"}}}); len(got) != 0 {
+		t.Errorf("durableDirMountPaths() without durable dirs = %v, want none", got)
 	}
 }

@@ -422,8 +422,10 @@ spec:
                       OnCommit specifies what to include in the snapshot when a commit is requested.
                       If not provided, the "Full" behavior is used by default.
                       onCommit must be a subset of the onPause content.
-                      Note: Data scope only captures DurableDir-typed volumes; external/CSI
-                      volumes are not snapshotted as they persist independently.
+                      Note: what Data scope captures depends on the sandbox class: gVisor saves
+                      the filesystem delta on top of the OCI image, micro-VM only the attached
+                      DurableDir volumes. External/CSI volumes are never snapshotted as they
+                      persist independently.
 
                       For example:
                         - if onPause is "Full", then onCommit can be "Full" or "Data".
@@ -437,8 +439,10 @@ spec:
                     description: |-
                       OnPause specifies what to include in the snapshot when the actor is paused.
                       If not provided, the "Full" behavior is used by default.
-                      Note: Data scope only captures DurableDir-typed volumes; external/CSI
-                      volumes are not snapshotted as they persist independently.
+                      Note: what Data scope captures depends on the sandbox class: gVisor saves
+                      the filesystem delta on top of the OCI image, micro-VM only the attached
+                      DurableDir volumes. External/CSI volumes are never snapshotted as they
+                      persist independently.
                     enum:
                     - Full
                     - Data

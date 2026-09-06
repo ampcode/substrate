@@ -469,10 +469,13 @@ const (
 	// Full captures process memory plus the entire filesystem delta on top of
 	// the OCI image (including any attached DurableDir volumes).
 	SnapshotScopeFull SnapshotScope = "Full"
-	// Data captures only the contents of attached volumes that support
-	// snapshots (currently DurableDir-typed volumes; external/CSI volumes
-	// are not snapshotted as they persist independently). Process memory and
-	// the rest of rootfs are excluded.
+	// Data captures filesystem state only; process memory is excluded, so the
+	// snapshot restores on any host regardless of its CPU. What it holds
+	// depends on the sandbox class: gVisor saves the filesystem delta on top
+	// of the OCI image (every container's rootfs plus any attached DurableDir
+	// volumes); micro-VM saves only the attached DurableDir volumes, as its
+	// rootfs writes live in guest memory. External/CSI volumes are never
+	// snapshotted as they persist independently.
 	SnapshotScopeData SnapshotScope = "Data"
 )
 
@@ -483,7 +486,8 @@ type ResumeSource string
 
 const (
 	// ResumeSourceColdBoot starts the actor's containers afresh from the OCI
-	// image, with the durable-dir volumes pre-populated from the snapshot.
+	// image, with the filesystem state the Data snapshot holds restored before
+	// the processes start.
 	ResumeSourceColdBoot ResumeSource = "ColdBoot"
 	// ResumeSourceGolden restores the ActorTemplate's golden snapshot (guest
 	// memory + filesystem delta) and serves the snapshot's durable data to
@@ -518,8 +522,10 @@ type SnapshotsConfig struct {
 
 	// OnPause specifies what to include in the snapshot when the actor is paused.
 	// If not provided, the "Full" behavior is used by default.
-	// Note: Data scope only captures DurableDir-typed volumes; external/CSI
-	// volumes are not snapshotted as they persist independently.
+	// Note: what Data scope captures depends on the sandbox class: gVisor saves
+	// the filesystem delta on top of the OCI image, micro-VM only the attached
+	// DurableDir volumes. External/CSI volumes are never snapshotted as they
+	// persist independently.
 	//
 	// +optional
 	// +kubebuilder:default=Full
@@ -528,8 +534,10 @@ type SnapshotsConfig struct {
 	// OnCommit specifies what to include in the snapshot when a commit is requested.
 	// If not provided, the "Full" behavior is used by default.
 	// onCommit must be a subset of the onPause content.
-	// Note: Data scope only captures DurableDir-typed volumes; external/CSI
-	// volumes are not snapshotted as they persist independently.
+	// Note: what Data scope captures depends on the sandbox class: gVisor saves
+	// the filesystem delta on top of the OCI image, micro-VM only the attached
+	// DurableDir volumes. External/CSI volumes are never snapshotted as they
+	// persist independently.
 	//
 	// For example:
 	//   - if onPause is "Full", then onCommit can be "Full" or "Data".

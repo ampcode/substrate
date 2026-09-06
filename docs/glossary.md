@@ -109,11 +109,13 @@ because they change too frequently for etcd.
   - **`Full`**: process memory plus the rootfs delta on top of the OCI
     image, and any attached `DurableDir` volumes. Used to capture
     everything needed to resume hot.
-  - **`Data`**: only the contents of attached volumes that support
-    snapshots — currently `DurableDir` volumes. Process memory and the
-    rest of rootfs are discarded. Used to persist application data
-    cheaply without the cost of a full memory image. How the Actor comes
-    back on Resume is governed by the
+  - **`Data`**: filesystem state only; process memory is discarded, so the
+    snapshot restores on any host regardless of its CPU model. What it
+    holds depends on the sandbox class: `gvisor` saves the rootfs delta of
+    every container plus any `DurableDir` volumes; `microvm` saves only the
+    `DurableDir` volumes, as its rootfs writes live in guest memory. Used to
+    persist application data cheaply without the cost of a full memory
+    image. How the Actor comes back on Resume is governed by the
     [Resume sources](#snapshots) (`onResume.fromData`): cold-boot by
     default, or combined with the [Golden Snapshot](#snapshots).
 
@@ -130,7 +132,7 @@ because they change too frequently for etcd.
   `onResume.fromData` applies when the Resume uses a `Data`-scope snapshot
   (from either trigger):
   - **`ColdBoot`** (default): start the containers afresh from the OCI image
-    with the `DurableDir` contents restored.
+    with the filesystem state the `Data` snapshot holds restored first.
   - **`Golden`**: restore the template's [Golden Snapshot](#snapshots)
     (process memory + rootfs delta) and serve the Actor's `DurableDir` data
     to it, so the Actor resumes with the golden's warm state over its own

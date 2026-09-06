@@ -55,6 +55,19 @@ func durableVolumeNames(spec *ateompb.WorkloadSpec) []string {
 	return slices.Compact(names)
 }
 
+// durableDirMountPaths returns the sorted, deduplicated paths at which workload
+// containers mount durable-dir volumes.
+func durableDirMountPaths(spec *ateompb.WorkloadSpec) []string {
+	var paths []string
+	for _, c := range spec.GetContainers() {
+		for _, m := range c.GetDurableDirVolumeMounts() {
+			paths = append(paths, m.GetMountPath())
+		}
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths)
+}
+
 // nvproxyGlobalArgs returns the runsc global flags for GPU sandboxes, enabling
 // gVisor's GPU ioctl proxy when the worker has a GPU. --nvproxy must be set when
 // the sandbox is created (the pause/root container) so the sentry initializes GPU
@@ -193,9 +206,16 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 	return nil
 }
 
-func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
-	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
-
+// fsCheckpointArgs builds the argv for `runsc fscheckpoint`. Factored out so
+// the argument construction can be unit-tested without executing runsc.
+//
+// A filesystem checkpoint saves the disk-backed tmpfs filesystems whose
+// resource ID matches one of the -path flags. A bare "/" matches the rootfs
+// overlay upper of every container in the sandbox, so the whole filesystem
+// delta on top of the OCI images is captured, not just the durable-dir
+// volumes. Unlike a process checkpoint the image carries no CPU state, so it
+// restores on any host that runs the same runsc release.
+func (r *runsc) fsCheckpointArgs(containerName, checkpointPath string, durableDirMounts []string) []string {
 	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
@@ -207,18 +227,25 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"fscheckpoint",
 		"-image-path", checkpointPath,
+		"-path", "/",
 	}
+	// Durable-dir volumes are bind mounts with their own resource IDs, which
+	// "/" does not match.
 	for _, ddv := range durableDirMounts {
 		args = append(args, "-path", ddv)
 	}
 
 	// name of the container must be the last parameter.
-	args = append(args, containerName)
+	return append(args, containerName)
+}
+
+func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
+	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
 
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
-		args...,
+		r.fsCheckpointArgs(containerName, checkpointPath, durableDirMounts)...,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
