@@ -135,6 +135,25 @@ func TestBuild_Capabilities(t *testing.T) {
 	}
 }
 
+// Every process starts with a pod-sized open file limit; the container cannot
+// raise the hard limit itself.
+func TestBuild_NofileLimit(t *testing.T) {
+	spec := Build(Options{ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"}})
+
+	var nofile *specs.POSIXRlimit
+	for i := range spec.Process.Rlimits {
+		if spec.Process.Rlimits[i].Type == "RLIMIT_NOFILE" {
+			nofile = &spec.Process.Rlimits[i]
+		}
+	}
+	if nofile == nil {
+		t.Fatalf("Rlimits = %v, want RLIMIT_NOFILE", spec.Process.Rlimits)
+	}
+	if nofile.Soft != 1048576 || nofile.Hard != 1048576 {
+		t.Errorf("RLIMIT_NOFILE = %d/%d, want 1048576/1048576", nofile.Soft, nofile.Hard)
+	}
+}
+
 // The pause container gets no capabilities.
 func TestBuild_NoCapabilitiesForPause(t *testing.T) {
 	spec := Build(Options{ActorUID: testActorUID, ContainerName: PauseContainer, Args: []string{"/pause"}})

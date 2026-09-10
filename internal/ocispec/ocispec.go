@@ -33,6 +33,14 @@ const specFile = "config.json"
 // hostname is the UTS hostname for actor containers.
 const hostname = "actor"
 
+// nofileLimit is the RLIMIT_NOFILE soft and hard limit for every process in an
+// actor container. It matches what containerd gives Kubernetes pods, so tools
+// tuned for pods behave the same here. Nothing in the container can raise the
+// hard limit (that takes CAP_SYS_RESOURCE), so the value must already be high
+// enough for workloads that open thousands of files at once; runc's 1024 makes
+// Node.js fail with EMFILE at a Promise.all over ~1000 fs.writeFile calls.
+const nofileLimit = 1048576
+
 // Options describes one actor container. Args, Env and Capabilities arrive
 // already resolved.
 type Options struct {
@@ -102,8 +110,8 @@ func Build(o Options) *specs.Spec {
 			Rlimits: []specs.POSIXRlimit{
 				{
 					Type: "RLIMIT_NOFILE",
-					Hard: 1024,
-					Soft: 1024,
+					Hard: nofileLimit,
+					Soft: nofileLimit,
 				},
 			},
 		},
