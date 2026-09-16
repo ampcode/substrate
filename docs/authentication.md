@@ -23,6 +23,28 @@ Provider names and issuers must be unique. `issuer` must be an HTTPS URL and
 matches. `certificateAuthorityFile` and `discoveryTokenFile` are optional and
 are needed for OIDC discovery against some private Kubernetes API servers.
 
+`jwksURI` is optional. When set, `ate-api` skips OIDC discovery and fetches the
+issuer's signing keys from that HTTPS URL; tokens must still carry `issuer` as
+their `iss` claim. Use it when the cluster's service account issuer is an
+external URL that `ate-api` cannot reach (EKS, AKS and GKE clusters without
+egress): every Kubernetes API server serves its own keys at
+`/openid/v1/jwks`, so the following verifies service account tokens with no
+traffic leaving the cluster. `discoveryTokenFile` is also sent to `jwksURI`.
+
+```yaml
+actorIdentityJWTProvider: kubernetes
+jwtProviders:
+- name: kubernetes
+  issuer: https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE
+  audiences:
+  - api.ate-system.svc
+  jwksURI: https://kubernetes.default.svc/openid/v1/jwks
+  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Find the issuer with `kubectl get --raw /.well-known/openid-configuration`.
+
 `actorIdentityJWTProvider` identifies the provider allowed to call
 `ActorIdentity.MintJWT`. Other authenticated providers can call every RPC.
 Authorization and RBAC are not implemented yet, so only configure providers

@@ -27,8 +27,11 @@ func TestLoadAuthenticationConfig(t *testing.T) {
 actorIdentityJWTProvider: kubernetes
 jwtProviders:
 - name: kubernetes
-  issuer: https://kubernetes.default.svc
+  issuer: https://oidc.eks.us-east-1.amazonaws.com/id/ABCDEF
   audiences: [api.ate-system.svc]
+  jwksURI: https://kubernetes.default.svc/openid/v1/jwks
+  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
 - name: google
   issuer: https://accounts.google.com
   audiences: [cloud-sdk-client]
@@ -41,6 +44,12 @@ jwtProviders:
 	}
 	if got := len(cfg.JWTProviders); got != 2 {
 		t.Fatalf("len(JWTProviders) = %d, want 2", got)
+	}
+	if got := cfg.JWTProviders[0].JWKSURI; got != "https://kubernetes.default.svc/openid/v1/jwks" {
+		t.Fatalf("JWTProviders[0].JWKSURI = %q", got)
+	}
+	if got := cfg.JWTProviders[1].JWKSURI; got != "" {
+		t.Fatalf("JWTProviders[1].JWKSURI = %q, want empty", got)
 	}
 }
 
@@ -83,6 +92,10 @@ func TestValidateAuthenticationConfig(t *testing.T) {
 		{name: "insecure issuer", mutate: func(c *AuthenticationConfig) { c.JWTProviders[0].Issuer = "http://issuer.example" }},
 		{name: "no audiences", mutate: func(c *AuthenticationConfig) { c.JWTProviders[0].Audiences = nil }},
 		{name: "duplicate provider", mutate: func(c *AuthenticationConfig) { c.JWTProviders = append(c.JWTProviders, c.JWTProviders[0]) }},
+		{name: "insecure jwksURI", mutate: func(c *AuthenticationConfig) {
+			c.JWTProviders[0].JWKSURI = "http://kubernetes.default.svc/openid/v1/jwks"
+		}},
+		{name: "relative jwksURI", mutate: func(c *AuthenticationConfig) { c.JWTProviders[0].JWKSURI = "/openid/v1/jwks" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
