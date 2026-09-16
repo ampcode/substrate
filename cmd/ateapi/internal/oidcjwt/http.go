@@ -25,8 +25,10 @@ import (
 	"time"
 )
 
-// NewHTTPClient returns a client for OIDC discovery and JWKS requests.
-func NewHTTPClient(issuer, certificateAuthorityFile, discoveryTokenFile string) (*http.Client, error) {
+// NewHTTPClient returns a client for OIDC discovery and JWKS requests. jwksURI
+// is the provider's configured JWKS URI, or empty when keys come from OIDC
+// discovery; when a discovery token is configured it is also sent to that URI.
+func NewHTTPClient(issuer, jwksURI, certificateAuthorityFile, discoveryTokenFile string) (*http.Client, error) {
 	if discoveryTokenFile != "" && certificateAuthorityFile == "" {
 		return nil, fmt.Errorf("discovery token file requires a certificate authority file")
 	}
@@ -44,22 +46,25 @@ func NewHTTPClient(issuer, certificateAuthorityFile, discoveryTokenFile string) 
 	}
 	var roundTripper http.RoundTripper = transport
 	if discoveryTokenFile != "" {
-		roundTripper = &issuerDiscoveryTransport{base: transport, tokenFile: discoveryTokenFile, issuer: issuer}
+		roundTripper = &issuerDiscoveryTransport{base: transport, tokenFile: discoveryTokenFile, issuer: issuer, jwksURI: jwksURI}
 	}
 	return &http.Client{Timeout: 10 * time.Second, Transport: roundTripper}, nil
 }
 
 // issuerDiscoveryTransport injects a bearer token for requests within the
-// configured issuer and Kubernetes' standard JWKS path. Reads the token file
-// on every request so rotation is handled automatically.
+// configured issuer, to the configured JWKS URI, and to Kubernetes' standard
+// JWKS path. Reads the token file on every request so rotation is handled
+// automatically.
 type issuerDiscoveryTransport struct {
 	base      http.RoundTripper
 	tokenFile string
 	issuer    string
+	jwksURI   string
 }
 
 func (t *issuerDiscoveryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if issuerScopedURL(req.URL.String(), t.issuer) || isKubernetesJWKSURL(req.URL.String()) {
+	rawURL := req.URL.String()
+	if issuerScopedURL(rawURL, t.issuer) || isKubernetesJWKSURL(rawURL) || (t.jwksURI != "" && rawURL == t.jwksURI) {
 		token, err := os.ReadFile(t.tokenFile)
 		if err != nil {
 			return nil, fmt.Errorf("read discovery token file: %w", err)

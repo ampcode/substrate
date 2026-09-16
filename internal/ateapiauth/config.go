@@ -35,6 +35,13 @@ type JWTProviderConfig struct {
 	Audiences                []string `json:"audiences"`
 	CertificateAuthorityFile string   `json:"certificateAuthorityFile,omitempty"`
 	DiscoveryTokenFile       string   `json:"discoveryTokenFile,omitempty"`
+	// JWKSURI, when set, is where the issuer's signing keys are fetched from
+	// instead of the jwks_uri advertised by OIDC discovery, and discovery is
+	// skipped. Tokens must still carry Issuer as their iss claim. This lets a
+	// cluster whose service account issuer is an external URL (EKS, AKS, GKE)
+	// verify tokens without egress, by reading the keys the API server serves at
+	// https://kubernetes.default.svc/openid/v1/jwks.
+	JWKSURI string `json:"jwksURI,omitempty"`
 }
 
 // LoadAuthenticationConfig strictly parses and validates a YAML or JSON file.
@@ -81,6 +88,12 @@ func ValidateAuthenticationConfig(cfg *AuthenticationConfig) error {
 			return fmt.Errorf("duplicate JWT provider issuer %q", p.Issuer)
 		}
 		issuers[p.Issuer] = true
+		if p.JWKSURI != "" {
+			jwksURL, err := url.Parse(p.JWKSURI)
+			if err != nil || jwksURL.Scheme != "https" || jwksURL.Host == "" {
+				return fmt.Errorf("%s.jwksURI must be an HTTPS URL", field)
+			}
+		}
 		if len(p.Audiences) == 0 {
 			return fmt.Errorf("%s.audiences must contain at least one audience", field)
 		}

@@ -502,11 +502,15 @@ func buildJWTProviders(ctx context.Context, cfg *ateapiauth.AuthenticationConfig
 	var serverCfg ateapiauth.ServerConfig
 	var actorIdentityIssuer string
 	for _, providerCfg := range cfg.JWTProviders {
-		httpClient, err := oidcjwt.NewHTTPClient(providerCfg.Issuer, providerCfg.CertificateAuthorityFile, providerCfg.DiscoveryTokenFile)
+		httpClient, err := oidcjwt.NewHTTPClient(providerCfg.Issuer, providerCfg.JWKSURI, providerCfg.CertificateAuthorityFile, providerCfg.DiscoveryTokenFile)
 		if err != nil {
 			return ateapiauth.ServerConfig{}, "", fmt.Errorf("initialize JWT provider %q: %w", providerCfg.Name, err)
 		}
-		verifier := oidcjwt.NewVerifier(providerCfg.Issuer, providerCfg.Audiences, httpClient)
+		var verifierOpts []oidcjwt.VerifierOption
+		if providerCfg.JWKSURI != "" {
+			verifierOpts = append(verifierOpts, oidcjwt.WithJWKSURI(providerCfg.JWKSURI))
+		}
+		verifier := oidcjwt.NewVerifier(providerCfg.Issuer, providerCfg.Audiences, httpClient, verifierOpts...)
 		serverCfg.JWTProviders = append(serverCfg.JWTProviders, ateapiauth.JWTProvider{
 			Name:   providerCfg.Name,
 			Issuer: providerCfg.Issuer,

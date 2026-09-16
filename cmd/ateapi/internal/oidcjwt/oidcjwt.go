@@ -126,6 +126,9 @@ type Verifier struct {
 	issuer     string
 	audiences  []string
 	httpClient *http.Client
+	// jwksURI, when non-empty, replaces OIDC discovery: keys are fetched from
+	// it directly. Tokens are still required to name issuer in their iss claim.
+	jwksURI string
 
 	mu                    sync.RWMutex
 	keys                  []*KeyAndID
@@ -134,10 +137,26 @@ type Verifier struct {
 	lastUnknownKeyRefresh time.Time
 }
 
+// VerifierOption configures a Verifier beyond its issuer and audiences.
+type VerifierOption func(*Verifier)
+
+// WithJWKSURI makes the verifier fetch signing keys from jwksURI instead of
+// running OIDC discovery against the issuer. Use it when the issuer URL is not
+// reachable from ate-api but its keys are served elsewhere, such as a
+// Kubernetes API server at https://kubernetes.default.svc/openid/v1/jwks whose
+// service account issuer is an external URL.
+func WithJWKSURI(jwksURI string) VerifierOption {
+	return func(v *Verifier) { v.jwksURI = jwksURI }
+}
+
 // NewVerifier returns a verifier for issuer. A token is accepted when at least
 // one of its audiences matches audiences.
-func NewVerifier(issuer string, audiences []string, httpClient *http.Client) *Verifier {
-	return &Verifier{issuer: issuer, audiences: slices.Clone(audiences), httpClient: httpClient}
+func NewVerifier(issuer string, audiences []string, httpClient *http.Client, opts ...VerifierOption) *Verifier {
+	v := &Verifier{issuer: issuer, audiences: slices.Clone(audiences), httpClient: httpClient}
+	for _, opt := range opts {
+		opt(v)
+	}
+	return v
 }
 
 // Verify verifies and extracts claims from a JWT.
@@ -308,7 +327,7 @@ func (v *Verifier) key(ctx context.Context, keyID string, now time.Time) (crypto
 	if key == nil && len(v.keys) > 0 {
 		v.lastUnknownKeyRefresh = now
 	}
-	keys, err := discoverKeysForIssuer(ctx, v.httpClient, v.issuer)
+	keys, err := v.fetchKeys(ctx)
 	if err != nil {
 		v.lastFailedRefresh = now
 		if key != nil {
@@ -455,6 +474,15 @@ type jwkT struct {
 	RSAE string `json:"e"`
 }
 
+// fetchKeys returns the issuer's current signing keys, from the configured JWKS
+// URI when one is set and through OIDC discovery otherwise.
+func (v *Verifier) fetchKeys(ctx context.Context) ([]*KeyAndID, error) {
+	if v.jwksURI != "" {
+		return fetchKeysFromJWKS(ctx, v.httpClient, v.issuer, v.jwksURI)
+	}
+	return discoverKeysForIssuer(ctx, v.httpClient, v.issuer)
+}
+
 func discoverKeysForIssuer(ctx context.Context, httpClient *http.Client, issuer string) ([]*KeyAndID, error) {
 	var discoveryDocURL string
 	if strings.HasSuffix(issuer, "/") {
@@ -473,7 +501,13 @@ func discoverKeysForIssuer(ctx context.Context, httpClient *http.Client, issuer 
 
 	slog.InfoContext(ctx, "Fetched discovery doc", slog.Any("doc", oidcConfig))
 
-	jwkSet, err := fetchJSON[jwkSetT](ctx, httpClient, oidcConfig.JWKSURI)
+	return fetchKeysFromJWKS(ctx, httpClient, issuer, oidcConfig.JWKSURI)
+}
+
+// fetchKeysFromJWKS fetches the JWK set at jwksURI and returns its usable
+// keys. issuer is only used for log and error messages.
+func fetchKeysFromJWKS(ctx context.Context, httpClient *http.Client, issuer, jwksURI string) ([]*KeyAndID, error) {
+	jwkSet, err := fetchJSON[jwkSetT](ctx, httpClient, jwksURI)
 	if err != nil {
 		return nil, fmt.Errorf("while fetching JWKS: %w", err)
 	}
