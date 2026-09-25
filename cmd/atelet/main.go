@@ -1154,6 +1154,16 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		runtimeRec = goldenRec
 	}
 
+	// The actor's files staged into the restore dir. On a DATA_ON_GOLDEN
+	// restore only the durable-dir tar may join the golden's set: a gVisor
+	// DATA snapshot also holds a filesystem checkpoint whose pages files share
+	// their names with a full checkpoint's memory pages, and the rootfs delta
+	// they carry cannot be laid over a memory image anyway.
+	actorFiles := sandboxRec.SnapshotFiles
+	if goldenRec != nil {
+		actorFiles = dataOnGoldenActorFiles(actorFiles)
+	}
+
 	// Undo the Register if the restore fails.
 	defer func() {
 		if err != nil {
@@ -1185,10 +1195,10 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 				if goldenRec == nil {
 					return fmt.Errorf("no golden snapshot record for a %s restore", req.GetScope())
 				}
-				if err := s.downloadCombinedCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), req.GetGoldenSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles, goldenRec.SnapshotFiles); err != nil {
+				if err := s.downloadCombinedCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), req.GetGoldenSnapshotUri(), checkpointDir, actorFiles, goldenRec.SnapshotFiles); err != nil {
 					return err
 				}
-			} else if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
+			} else if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, actorFiles); err != nil {
 				return err
 			}
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
@@ -1201,14 +1211,14 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			// the golden's from object storage, concurrently.
 			gLocal, gLocalCtx := errgroup.WithContext(gctx)
 			gLocal.Go(func() error {
-				if err := s.copyLocalCheckpoint(gLocalCtx, req.GetLocalConfig().GetSnapshotName(), ateompath.LocalCheckpointsDir(actorUID), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
+				if err := s.copyLocalCheckpoint(gLocalCtx, req.GetLocalConfig().GetSnapshotName(), ateompath.LocalCheckpointsDir(actorUID), checkpointDir, actorFiles); err != nil {
 					return err
 				}
 				return nil
 			})
 			if combineWithGolden {
 				gLocal.Go(func() error {
-					if err := s.downloadExternalCheckpoint(gLocalCtx, req.GetGoldenSnapshotUri(), checkpointDir, goldenOnlyFiles(sandboxRec.SnapshotFiles, goldenRec.SnapshotFiles)); err != nil {
+					if err := s.downloadExternalCheckpoint(gLocalCtx, req.GetGoldenSnapshotUri(), checkpointDir, goldenOnlyFiles(actorFiles, goldenRec.SnapshotFiles)); err != nil {
 						return err
 					}
 					return nil
@@ -1387,6 +1397,18 @@ func (s *AteomHerder) copyLocalCheckpoint(ctx context.Context, snapshotName stri
 		}
 	}
 
+	return nil
+}
+
+// dataOnGoldenActorFiles returns the files of the actor's own snapshot that a
+// DATA_ON_GOLDEN restore stages next to the golden snapshot's: the durable-dir
+// tar, if the snapshot has one, and nothing else. Whatever else a DATA snapshot
+// holds (a gVisor filesystem checkpoint) describes a cold boot, not the golden's
+// running guest, and its pages files would shadow the golden's memory pages.
+func dataOnGoldenActorFiles(actorFiles []string) []string {
+	if slices.Contains(actorFiles, ateompath.DurableDirTarFile) {
+		return []string{ateompath.DurableDirTarFile}
+	}
 	return nil
 }
 

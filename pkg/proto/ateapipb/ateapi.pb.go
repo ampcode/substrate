@@ -44,7 +44,10 @@ const (
 	SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED SnapshotContentScope = 0
 	// Captures process memory, root filesystem changes, and durable data.
 	SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL SnapshotContentScope = 1
-	// Captures durable data without process memory or root filesystem changes.
+	// Captures durable data without process memory. On gVisor it also captures
+	// each container's root filesystem changes, so the sandbox cold-boots with
+	// its files intact on any node; on micro-VMs root filesystem changes are
+	// discarded.
 	SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA SnapshotContentScope = 2 // Keep this in sync with the maximums on fields of this type.
 )
 

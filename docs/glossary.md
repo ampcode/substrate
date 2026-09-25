@@ -113,11 +113,14 @@ for etcd.
   - **`Full`**: process memory plus the rootfs delta on top of the OCI
     image, and any attached `DurableDir` volumes. Used to capture
     everything needed to resume hot.
-  - **`Data`**: only the contents of attached volumes that support
-    snapshots — currently `DurableDir` volumes. Process memory and the
-    rest of rootfs are discarded. Used to persist application data
-    cheaply without the cost of a full memory image. How the Actor comes
-    back on Resume is governed by the
+  - **`Data`**: the contents of attached volumes that support
+    snapshots — currently `DurableDir` volumes — and, on `gvisor`, the
+    rootfs delta of every container on top of its OCI image (a filesystem
+    checkpoint); on `microvm` the rootfs delta is discarded. Process
+    memory is never captured, so unlike `Full` the snapshot does not bind
+    to the CPU model of the node that took it and restores on any node.
+    Used to persist application data cheaply without the cost of a full
+    memory image. How the Actor comes back on Resume is governed by the
     [Resume sources](#snapshots) (`onResume.fromData`): cold-boot by
     default, or combined with the [Golden Snapshot](#snapshots).
 
@@ -134,11 +137,13 @@ for etcd.
   `onResume.fromData` applies when the Resume uses a `Data`-scope snapshot
   (from either trigger):
   - **`ColdBoot`** (default): start the containers afresh from the OCI image
-    with the `DurableDir` contents restored.
+    with the `DurableDir` contents restored, and on `gvisor` the rootfs
+    delta as well.
   - **`Golden`**: restore the template's [Golden Snapshot](#snapshots)
     (process memory + rootfs delta) and serve the Actor's `DurableDir` data
     to it, so the Actor resumes with the golden's warm state over its own
-    data. Currently `microvm`-only.
+    data. Only the `DurableDir` data joins the golden; a `gvisor` rootfs
+    delta cannot be laid over a memory image. Currently `microvm`-only.
 
   A still-valid `Full` snapshot always restores from its own content and is
   not configurable here.

@@ -844,6 +844,48 @@ func TestGoldenOnlyFiles(t *testing.T) {
 	}
 }
 
+// TestDataOnGoldenActorFiles verifies that only the durable-dir tar of the
+// actor's DATA snapshot joins the golden's set: a gVisor DATA snapshot also
+// holds a filesystem checkpoint whose pages.img and pages_meta.img would
+// otherwise shadow the golden's memory pages of the same name.
+func TestDataOnGoldenActorFiles(t *testing.T) {
+	tests := []struct {
+		name       string
+		actorFiles []string
+		want       []string
+	}{
+		{
+			name:       "gvisor filesystem checkpoint with durable tar keeps the tar only",
+			actorFiles: []string{"durable-dir.tar", "fscheckpoint.pb", "multitar.img", "pages.img", "pages_meta.img"},
+			want:       []string{"durable-dir.tar"},
+		},
+		{
+			name:       "gvisor filesystem checkpoint without durable tar contributes nothing",
+			actorFiles: []string{"fscheckpoint.pb", "multitar.img", "pages.img", "pages_meta.img"},
+			want:       nil,
+		},
+		{
+			name:       "micro-VM data snapshot is unchanged",
+			actorFiles: []string{"durable-dir.tar"},
+			want:       []string{"durable-dir.tar"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dataOnGoldenActorFiles(tc.actorFiles)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("dataOnGoldenActorFiles diff (-want +got):\n%s", diff)
+			}
+			// The pages files must never reach goldenOnlyFiles as shadows.
+			golden := []string{"checkpoint.img", "pages.img", "pages_meta.img", "durable-dir.tar"}
+			rest := goldenOnlyFiles(got, golden)
+			if !slices.Contains(rest, "pages.img") || !slices.Contains(rest, "pages_meta.img") {
+				t.Errorf("golden pages files shadowed: goldenOnlyFiles = %v", rest)
+			}
+		})
+	}
+}
+
 func TestRemoveActorDirsReclaimsTheRoot(t *testing.T) {
 	useTempNodeDirs(t)
 	const actorUID = "actor-uid-1"

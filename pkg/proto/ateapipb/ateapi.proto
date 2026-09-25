@@ -204,7 +204,10 @@ enum SnapshotContentScope {
   SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED = 0;
   // Captures process memory, root filesystem changes, and durable data.
   SNAPSHOT_CONTENT_SCOPE_FULL = 1;
-  // Captures durable data without process memory or root filesystem changes.
+  // Captures durable data without process memory. On gVisor it also captures
+  // each container's root filesystem changes, so the sandbox cold-boots with
+  // its files intact on any node; on micro-VMs root filesystem changes are
+  // discarded.
   SNAPSHOT_CONTENT_SCOPE_DATA = 2;
   // Keep this in sync with the maximums on fields of this type.
 }

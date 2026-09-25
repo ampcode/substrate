@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -178,11 +179,24 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 	return nil
 }
 
-//nolint:unused
-func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
-	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
+// fsCheckpointManifestFile is the manifest `runsc fscheckpoint` writes into its
+// image directory (gVisor's checkpointfiles.FSCheckpointManifestFileName). Its
+// presence is what tells a snapshot directory that holds a filesystem
+// checkpoint from one that holds durable-dir data only.
+const fsCheckpointManifestFile = "fscheckpoint.pb"
 
-	args := []string{
+// fsCheckpointArgs builds the argv for `runsc fscheckpoint`. Factored out so
+// the argument construction can be unit-tested without executing runsc.
+//
+// A filesystem checkpoint saves the disk-backed tmpfs filesystems whose
+// resource ID matches a -path flag. A bare "/" matches the rootfs overlay
+// upper of every container in the sandbox, so the whole filesystem delta on
+// top of the OCI images is captured. Durable-dir volumes are host bind mounts,
+// not tmpfs, so they are archived separately (see tarDurableVolumes). Unlike a
+// process checkpoint the image carries no memory or CPU state, so it restores
+// on any host with the same page size and endianness.
+func (r *runsc) fsCheckpointArgs(containerName, checkpointPath string) []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -193,18 +207,31 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"fscheckpoint",
 		"-image-path", checkpointPath,
+		"-path", "/",
+		// name of the container must be the last parameter.
+		containerName,
 	}
-	for _, ddv := range durableDirMounts {
-		args = append(args, "-path", ddv)
-	}
+}
 
-	// name of the container must be the last parameter.
-	args = append(args, containerName)
+// fsRestoreArgs returns the extra `runsc create` flags that restore the
+// sandbox's filesystems from the filesystem checkpoint in checkpointDir, or
+// nil when the directory holds none (a DATA snapshot carved out of a FULL
+// capture has only durable-dir data), in which case the sandbox boots from
+// its images alone.
+func fsRestoreArgs(checkpointDir string) []string {
+	if _, err := os.Stat(filepath.Join(checkpointDir, fsCheckpointManifestFile)); err != nil {
+		return nil
+	}
+	return []string{"--fs-restore-image-path", checkpointDir}
+}
+
+func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string) error {
+	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
 
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
-		args...,
+		r.fsCheckpointArgs(containerName, checkpointPath)...,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -228,6 +255,8 @@ func (r *runsc) pauseArgs(containerName string) []string {
 }
 
 // cmdPause pauses all processes in the container (or sandbox, if pause).
+//
+//nolint:unused
 func (r *runsc) cmdPause(ctx context.Context, containerName string) error {
 	slog.InfoContext(ctx, "About to run runsc pause", slog.String("container", containerName))
 
@@ -253,6 +282,8 @@ func (r *runsc) resumeArgs(containerName string) []string {
 }
 
 // cmdResume unpauses a paused container (or sandbox, if pause).
+//
+//nolint:unused
 func (r *runsc) cmdResume(ctx context.Context, containerName string) error {
 	slog.InfoContext(ctx, "About to run runsc resume", slog.String("container", containerName))
 
