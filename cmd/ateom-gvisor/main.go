@@ -42,6 +42,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomnet"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
+	"github.com/agent-substrate/substrate/internal/ateomsuspend"
 	"github.com/agent-substrate/substrate/internal/atunnel"
 	"github.com/agent-substrate/substrate/internal/childreap"
 	"github.com/agent-substrate/substrate/internal/contextlogging"
@@ -100,6 +101,16 @@ const actorHTTPUpstream = "http://" + ateomnet.ActorVethIP + ":80"
 // for the ateom, so the escalation to SIGKILL happens here rather than as a
 // kubelet SIGKILL of ateom itself.
 const workloadGracePeriod = 30 * time.Minute
+
+// suspendGracePeriod is how long shutdown waits for the control plane to
+// suspend the actors this worker hosts before stopping them itself. A worker
+// pod leaving (a WorkerPool roll, a node drain) is not the actor's fault, so
+// the actor is checkpointed and later resumes elsewhere with its state instead
+// of ending CRASHED. The suspend travels ateom -> atelet -> ateapi and comes
+// back as a CheckpointWorkload into this process, which is why it is allowed
+// while draining. Sized for a multi-GiB checkpoint and upload on a loaded
+// node, and well inside workloadGracePeriod.
+const suspendGracePeriod = 10 * time.Minute
 
 // resumeTimeout is the conservative ceiling for unpausing a paused sandbox.
 const resumeTimeout = 30 * time.Second
@@ -241,6 +252,19 @@ func do(ctx context.Context) error {
 
 	// Construct the service first so atunnel can use its namespace dialer.
 	ateomService := NewService(dnsRelay, actorLogger, *maxActors, *workerCredentialBundle, *podIdentityTrustBundle, *egressGatewayTrustBundle, *ateletIdentity)
+
+	// Shutdown asks the control plane to suspend the hosted actors through the
+	// node-local atelet, with the same credentials capacity reporting uses.
+	suspendRequester, err := ateomsuspend.NewRequester(ateomsuspend.Config{
+		SocketPath:           ateompath.AteomSupportSocket,
+		CredentialBundlePath: *workerCredentialBundle,
+		TrustBundlePath:      *podIdentityTrustBundle,
+		AteletSPIFFEID:       *ateletIdentity,
+	})
+	if err != nil {
+		return err
+	}
+	ateomService.suspendRequester = suspendRequester
 
 	atunnelIngress, atunnelEgress, atunnelEgressPort, err := runAtunnel(ctx, upstream)
 	if err != nil {
@@ -399,6 +423,10 @@ type AteomService struct {
 	// workload RPCs are rejected with codes.Unavailable.
 	shuttingDown atomic.Bool
 
+	// suspendRequester asks the control plane to suspend hosted actors when the
+	// worker shuts down. nil skips the request and stops the actors directly.
+	suspendRequester suspendRequester
+
 	// cgroupRoot is where the sandbox's cgroup v2 leaves live: the worker pod's
 	// own cgroup scope, which ateomcgroup.Delegate prepares. A field rather
 	// than a constant so tests can point GetWorkloadStats at a fixture tree.
@@ -412,6 +440,13 @@ type AteomService struct {
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)
+
+// suspendRequester is the slice of *ateomsuspend.Requester shutdown needs.
+// Narrowed to an interface so that code can be exercised without a socket or
+// certificates.
+type suspendRequester interface {
+	RequestSuspend(ctx context.Context, actor ateomsuspend.Actor) error
+}
 
 // NewService creates a new AteomService.
 func NewService(dnsRelay *atunnel.DNSRelay, actorLogger *actorlog.ActorLogger, maxActors int, workerCredentialBundlePath, podIdentityTrustBundlePath, egressGatewayTrustBundlePath, ateletSPIFFEID string) *AteomService {
@@ -480,12 +515,25 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 		slog.ErrorContext(ctx, "Giving up waiting for in-flight RPCs during graceful shutdown",
 			slog.Any("rpcs", s.inFlight.Names()))
 	}
+
+	// Actors still running get a chance to be suspended rather than stopped.
+	// A suspend that lands runs CheckpointWorkload here, which unhosts the
+	// actor, so what is left afterwards is what nobody suspended.
+	s.suspendHostedActors(ctx, deadline)
+	// A checkpoint the control plane started but did not answer for in time is
+	// still saving state; stopping its containers now would corrupt it.
+	if !s.inFlight.WaitIdle(waitCtx) {
+		slog.ErrorContext(ctx, "Giving up waiting for in-flight RPCs after requesting suspends",
+			slog.Any("rpcs", s.inFlight.Names()))
+	}
 	sessions := s.hostedSessions()
 
 	if len(sessions) == 0 {
 		slog.InfoContext(ctx, "No active workload at shutdown; exiting cleanly")
 		return
 	}
+	slog.WarnContext(ctx, "Stopping workloads the control plane did not suspend",
+		slog.Int("workloads", len(sessions)))
 
 	var wg sync.WaitGroup
 	for _, session := range sessions {
@@ -502,6 +550,56 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 	wg.Wait()
 
 	slog.InfoContext(ctx, "Shutting down")
+}
+
+// suspendHostedActors asks the control plane to suspend every actor with
+// running containers, in parallel, and returns once each request has been
+// answered or suspendGracePeriod has passed. The shared drain deadline still
+// applies if it is sooner. Requests that fail are logged; the caller stops
+// whatever is left running.
+func (s *AteomService) suspendHostedActors(ctx context.Context, deadline time.Time) {
+	if s.suspendRequester == nil {
+		return
+	}
+	running := s.runningActors()
+	if len(running) == 0 {
+		return
+	}
+	if suspendDeadline := time.Now().Add(suspendGracePeriod); suspendDeadline.Before(deadline) {
+		deadline = suspendDeadline
+	}
+	suspendCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, hosted := range running {
+		actor := ateomsuspend.Actor{
+			Atespace: hosted.attribution.Ref.Atespace,
+			Name:     hosted.attribution.Ref.Name,
+			UID:      hosted.attribution.UID,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slog.InfoContext(ctx, "Asking the control plane to suspend a hosted actor before shutdown",
+				slog.String("actor", hosted.attribution.Ref.String()),
+				slog.String("actorUID", actor.UID))
+			started := time.Now()
+			if err := s.suspendRequester.RequestSuspend(suspendCtx, actor); err != nil {
+				slog.WarnContext(ctx, "The control plane did not suspend a hosted actor before shutdown",
+					slog.String("actor", hosted.attribution.Ref.String()),
+					slog.String("actorUID", actor.UID),
+					slog.Duration("waited", time.Since(started)),
+					slog.Any("err", err))
+				return
+			}
+			slog.InfoContext(ctx, "Suspended a hosted actor before shutdown",
+				slog.String("actor", hosted.attribution.Ref.String()),
+				slog.String("actorUID", actor.UID),
+				slog.Duration("took", time.Since(started)))
+		}()
+	}
+	wg.Wait()
 }
 
 // containerKillTimeout bounds the post-SIGKILL wait, so a completely broken
