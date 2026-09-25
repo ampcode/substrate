@@ -244,12 +244,16 @@ spec:
           mountPath: "/var/run/atenet"
       - name: envoy
         image: envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4
+        # Keep Envoy at its default (info) log level. At debug, the router, http and ext_proc
+        # components write every request's headers to the pod log, including the Authorization
+        # bearer token clients present to actors, so a debug level is a credential leak: never
+        # set one here, and do not raise those components through the admin API on a cluster
+        # that serves real actors. A component that does not print headers (connection, for
+        # example) can be raised on one pod; treat even those logs as sensitive.
         command:
         - "/usr/local/bin/envoy"
         - "-c"
         - "/etc/envoy/envoy.yaml"
-        - "--component-log-level"
-        - "upstream:debug,router:debug,ext_proc:debug"
         # Prevents Envoy from fast-exiting on SIGTERM before atenet-router finishes
         # its drain sequence. Polls for the drain-complete marker written by the
         # router on the shared emptyDir, terminating Envoy as soon as the drain
