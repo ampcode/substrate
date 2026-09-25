@@ -470,11 +470,33 @@ data:
                       termination: "%CONNECTION_TERMINATION_DETAILS%"
 
       clusters:
+      # Every cluster on the tunnel path carries an explicit circuit breaker.
+      # Without one Envoy applies its default of 1024 connections, 1024
+      # pending requests and 1024 requests per cluster. One tunnel holds one
+      # connection on inner_internal for its whole life (max_requests_per_connection
+      # is 1, so nothing is pooled) and one on the passthrough or cleartext
+      # upstream, and every actor behind this gateway shares those pools. At
+      # ~1000 concurrent tunnels the default breaker tripped: every further
+      # CONNECT got 503 UO regardless of destination, and tunnels whose CONNECT
+      # had already succeeded were closed with UO on the inner leg, which the
+      # actor saw as a TLS handshake EOF. A few dozen actors running a package
+      # install at once is enough to get there. The tunnel count this gateway
+      # can hold is bounded by its file descriptors and memory, not by these
+      # numbers; they exist so the breaker reports overflow (the
+      # upstream_cx_overflow and upstream_rq_pending_overflow stats) only far
+      # past the concurrency the pod is sized for.
+      #
       # The only way into inner_listener. internal_upstream copies every
       # filter state object shared with the upstream (the actor identity, and
       # the passthrough destination when set) onto the inner connection.
       - name: inner_internal
         connect_timeout: 1s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         # One CONNECT per connection: the filter state internal_upstream copies
         # belongs to the tunnel this connection was made for, and a reused
         # connection would carry it into the next tunnel.
@@ -509,6 +531,15 @@ data:
         type: STATIC
         lb_policy: ROUND_ROBIN
         connect_timeout: 1s
+        # gRPC streams to the router, one per tunnel being classified; the
+        # 1024 default would fail classification (failure_mode_allow is false)
+        # at the same concurrency that trips the tunnel pools above.
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -529,6 +560,12 @@ data:
       - name: egress_forward_proxy_cleartext
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         cluster_type:
           name: envoy.clusters.dynamic_forward_proxy
           typed_config:
@@ -554,6 +591,12 @@ data:
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -568,6 +611,12 @@ data:
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
 
   # SDS resource for the gateway serving cert. kubelet rotates the projected
   # volume by swapping its ..data symlink, which fires the watch and makes
