@@ -1,0 +1,76 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# atelet for Amazon EKS: Amazon ECR credentials for image pulls (atelet pulls
+# actor and volume images itself, and private ECR has no anonymous pull; the
+# ECR credential helper uses the same IRSA role as the S3 backend, which needs
+# ecr:GetAuthorizationToken and the pull actions), no GCP credentials, and the
+# S3 snapshot backend pointed at Amazon S3 itself. The bucket's region comes
+# from the ate-aws-config ConfigMap (key region), which the installer creates;
+# the credentials come from IRSA: the installer annotates the atelet
+# ServiceAccount with eks.amazonaws.com/role-arn, and EKS's pod identity
+# webhook then projects a web identity token and sets AWS_ROLE_ARN and
+# AWS_WEB_IDENTITY_TOKEN_FILE on every atelet pod, which the SDK's default
+# credential chain in cmd/atelet uses. Nothing here names the account or role.
+#
+# atelet runs only on worker nodes (those labelled ate.dev/sandboxClass).
+# Actors are placed on ateom worker pods, which the WorkerPool schedules
+# there, so atelet has nothing to do elsewhere; and on EKS Auto Mode's
+# Bottlerocket nodes its hostPath and device-plugin setup would not work
+# anyway.
+#
+# args is replaced as a whole by the patch, so it repeats the base's
+# certificate and drain flags.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../atelet.yaml
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet-${SUBSTRATE_VERSION_SUFFIX}
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: ate.dev/sandboxClass
+                      operator: Exists
+            containers:
+            - name: atelet
+              args:
+              - --gcp-auth-for-image-pulls=false
+              - --ecr-auth-for-image-pulls=true
+              - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+              - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+              - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+              - --drain-delay=0s
+              - --drain-timeout=5m
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                valueFrom:
+                  configMapKeyRef:
+                    name: ate-aws-config
+                    key: region
