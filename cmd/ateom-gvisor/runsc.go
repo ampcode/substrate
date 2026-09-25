@@ -100,6 +100,11 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 		// way stays inside the sandbox: it is bounded by the container's
 		// capability set and never reaches the worker pod.
 		"--allow-suid",
+		// Keep CAP_NET_RAW when the container's capability set grants it. gVisor
+		// strips it at boot otherwise, and without it iptables inside the sandbox
+		// is unavailable, so Docker cannot NAT its containers' traffic. Acts on the
+		// actor's own network namespace only.
+		"--net-raw",
 	}
 	args = append(args,
 		"create",
@@ -314,10 +319,11 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		// "-log-packets",
 		// "-strace",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
-		// Match cmdCreate: size the restored sentry from the cgroup CPU quota and
-		// keep honoring setuid bits after restore.
+		// Match cmdCreate: size the restored sentry from the cgroup CPU quota, keep
+		// honoring setuid bits and keep CAP_NET_RAW after restore.
 		"--cpu-num-from-quota",
 		"--allow-suid",
+		"--net-raw",
 	}
 	restoreArgs = append(restoreArgs,
 		"restore",
