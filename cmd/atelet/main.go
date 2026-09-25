@@ -33,6 +33,8 @@ import (
 
 	"sync"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ategcs"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/sparsefile"
 	"github.com/agent-substrate/substrate/internal/actorlog"
@@ -235,6 +237,24 @@ func main() {
 	var wrappedGCS ategcs.ObjectStorage
 	storageBackend := os.Getenv("ATE_STORAGE_BACKEND")
 	switch storageBackend {
+	case "azblob":
+		// Azure Blob Storage in the account named by AZURE_STORAGE_ACCOUNT, authenticated
+		// with the default credential chain: on AKS that is the workload identity token
+		// projected into pods labelled azure.workload.identity/use.
+		account := os.Getenv("AZURE_STORAGE_ACCOUNT")
+		if account == "" {
+			serverboot.Fatal(ctx, "AZURE_STORAGE_ACCOUNT must be set for the azblob storage backend", nil)
+		}
+		slog.InfoContext(ctx, "Using Azure Blob storage backend", slog.String("account", account))
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to create Azure credential", err)
+		}
+		azureBlobClient, err := azblob.NewClient(fmt.Sprintf("https://%s.blob.core.windows.net/", account), cred, nil)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to create Azure Blob client", err)
+		}
+		wrappedGCS = ategcs.NewAzureBlobClient(azureBlobClient)
 	case "s3":
 		slog.InfoContext(ctx, "Using S3 storage backend")
 		// depend on standard AWS environment variables to configure the client

@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/oidcjwt"
@@ -398,6 +400,25 @@ func newObjectStore(ctx context.Context) (objectstore.Store, error) {
 				o.UsePathStyle = true
 			}
 		})), nil
+	case "azblob":
+		// Azure Blob Storage in the account named by AZURE_STORAGE_ACCOUNT,
+		// authenticated with the default credential chain: on AKS that is the
+		// workload identity token projected into pods labelled
+		// azure.workload.identity/use.
+		account := os.Getenv("AZURE_STORAGE_ACCOUNT")
+		if account == "" {
+			return nil, fmt.Errorf("AZURE_STORAGE_ACCOUNT must be set for the azblob storage backend")
+		}
+		slog.InfoContext(ctx, "Using Azure Blob storage backend", slog.String("account", account))
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating Azure credential: %w", err)
+		}
+		client, err := azblob.NewClient(fmt.Sprintf("https://%s.blob.core.windows.net/", account), cred, nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating Azure Blob client: %w", err)
+		}
+		return objectstore.NewAzureBlob(client), nil
 	// GCS is currently the default, TODO: we assume workload identity / ADC
 	default:
 		client, err := storage.NewClient(ctx)
