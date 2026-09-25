@@ -122,8 +122,8 @@ func (r *ActorTemplateReconciler) resync(ctx context.Context) {
 		}
 		for _, tmpl := range page.Items {
 			ref := resources.ActorTemplateRefFromActorTemplate(tmpl)
-			if goldenSnapshotDone(tmpl.GetStatus().GetGoldenSnapshotStatus()) {
-				slog.DebugContext(ctx, "Skipping actor template with terminal golden snapshot status", slog.String("ActorTemplate", ref.String()))
+			if !wantsGoldenSnapshot(tmpl) {
+				slog.DebugContext(ctx, "Skipping actor template without a golden snapshot to build", slog.String("ActorTemplate", ref.String()))
 			} else {
 				r.queue.Add(ref)
 				slog.InfoContext(ctx, "Added actor template to work queue", slog.String("ActorTemplate", ref.String()))
@@ -188,6 +188,11 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 			return 0, nil
 		}
 		return 0, err
+	}
+
+	if tmpl.GetSnapshotConfig().GetSkipGoldenSnapshot() {
+		// The template opted out: its actors cold-boot from their images.
+		return 0, nil
 	}
 
 	goldenActorRef := &ateapipb.ObjectRef{
@@ -399,6 +404,14 @@ func truncateUTF8(s string, n int) string {
 // terminal state: the snapshot was recorded, or the build failed.
 func goldenSnapshotDone(snapshotStatus *ateapipb.GoldenSnapshotStatus) bool {
 	return snapshotStatus.GetGoldenTag() != nil || snapshotStatus.GetErrorMessage() != ""
+}
+
+// wantsGoldenSnapshot reports whether the reconciler still has a golden
+// snapshot to build for the template: it has not opted out through
+// snapshot_config.skip_golden_snapshot, and the build has neither completed
+// nor failed.
+func wantsGoldenSnapshot(tmpl *ateapipb.ActorTemplate) bool {
+	return !tmpl.GetSnapshotConfig().GetSkipGoldenSnapshot() && !goldenSnapshotDone(tmpl.GetStatus().GetGoldenSnapshotStatus())
 }
 
 // goldenSnapshotWarmupFor returns 0 when every container has a wakeup probe

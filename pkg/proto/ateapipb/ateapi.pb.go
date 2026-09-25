@@ -2492,8 +2492,17 @@ type SnapshotConfig struct {
 	// +k8s:maxLength=1024
 	// +k8s:customValidation # Validate URI
 	StorageLocation string `protobuf:"bytes,4,opt,name=storage_location,json=storageLocation,proto3" json:"storage_location,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// skip_golden_snapshot, when true, keeps the template controller from
+	// building the template's golden snapshot. Actors created without a
+	// source_tag then cold-boot from their OCI images, and on_resume.from_data
+	// must not be GOLDEN. Set it when a FULL snapshot of the template is not
+	// wanted: a FULL snapshot binds to the CPU model of the node that took it,
+	// and a large image makes it slow to build and costly to store.
+	//
+	// +k8s:optional
+	SkipGoldenSnapshot bool `protobuf:"varint,5,opt,name=skip_golden_snapshot,json=skipGoldenSnapshot,proto3" json:"skip_golden_snapshot,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SnapshotConfig) Reset() {
@@ -2552,6 +2561,13 @@ func (x *SnapshotConfig) GetStorageLocation() string {
 		return x.StorageLocation
 	}
 	return ""
+}
+
+func (x *SnapshotConfig) GetSkipGoldenSnapshot() bool {
+	if x != nil {
+		return x.SkipGoldenSnapshot
+	}
+	return false
 }
 
 // OnResumeConfig selects, per snapshot situation, what supplies the guest
@@ -7298,12 +7314,13 @@ const file_ateapi_proto_rawDesc = "" +
 	"\rSandboxConfig\x129\n" +
 	"\rsandbox_class\x18\x01 \x01(\x0e2\x14.ateapi.SandboxClassR\fsandboxClass\x12\x1f\n" +
 	"\vconfig_name\x18\x02 \x01(\tR\n" +
-	"configName\"\xe4\x01\n" +
+	"configName\"\x96\x02\n" +
 	"\x0eSnapshotConfig\x127\n" +
 	"\bon_pause\x18\x01 \x01(\x0e2\x1c.ateapi.SnapshotContentScopeR\aonPause\x129\n" +
 	"\ton_commit\x18\x02 \x01(\x0e2\x1c.ateapi.SnapshotContentScopeR\bonCommit\x123\n" +
 	"\ton_resume\x18\x03 \x01(\v2\x16.ateapi.OnResumeConfigR\bonResume\x12)\n" +
-	"\x10storage_location\x18\x04 \x01(\tR\x0fstorageLocation\"C\n" +
+	"\x10storage_location\x18\x04 \x01(\tR\x0fstorageLocation\x120\n" +
+	"\x14skip_golden_snapshot\x18\x05 \x01(\bR\x12skipGoldenSnapshot\"C\n" +
 	"\x0eOnResumeConfig\x121\n" +
 	"\tfrom_data\x18\x01 \x01(\x0e2\x14.ateapi.ResumeSourceR\bfromData\"\xf5\x02\n" +
 	"\tContainer\x12\x12\n" +

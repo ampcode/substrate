@@ -443,6 +443,8 @@ When an `ActorTemplate` is created:
 
 `CreateActor` uses an explicit `sourceTag` when supplied; otherwise it resolves the template's golden tag and records that snapshot on the new actor. If the golden tag is not ready yet, the actor starts without a snapshot and cold-boots even if the tag becomes ready before its first resume. The default does not populate the caller-owned `sourceTag` field. Deleting the template collects its golden tag and any unfinished golden actor.
 
+A template opts out of the golden snapshot with `snapshotConfig.skipGoldenSnapshot: true`. Substrate then builds no golden actor or tag, every actor created without a `sourceTag` cold-boots from its images, and `snapshotConfig.onResume.fromData` must not be `Golden`. Use it when a `Full` snapshot of the template is not wanted: it binds to the CPU model of the node that took it, and a large image makes it slow to build and costly to store.
+
 ### Resumption Lifecycle
 Once a template is `Ready`, creating an actor logically (via `kubectl ate create actor`) allows it to be resumed instantly on any free worker in the referenced `WorkerPool`. Substrate bypasses the standard container boot and restores the process directly from its last saved state.
 

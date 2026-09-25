@@ -352,6 +352,13 @@ func withFailed(reason string) func(*ateapipb.ActorTemplate) {
 	}
 }
 
+func withSkipGoldenSnapshot(tmpl *ateapipb.ActorTemplate) {
+	if tmpl.SnapshotConfig == nil {
+		tmpl.SnapshotConfig = &ateapipb.SnapshotConfig{}
+	}
+	tmpl.SnapshotConfig.SkipGoldenSnapshot = true
+}
+
 func newTestTemplateReconciler(persistence templateReconcilerStore, control goldenActorControl) *ActorTemplateReconciler {
 	return NewActorTemplateReconciler(persistence, control, 7*time.Second)
 }
@@ -552,6 +559,11 @@ func TestReconcileOne(t *testing.T) {
 			control:          &fakeGoldenControl{},
 			wantFailedReason: reasonGoldenActorCrashed,
 			wantMessage:      "seeded failure",
+		},
+		{
+			name:     "template that skips the golden snapshot is a noop",
+			template: testTemplate(withSkipGoldenSnapshot),
+			control:  &fakeGoldenControl{},
 		},
 	}
 	for _, tt := range tests {
@@ -803,6 +815,7 @@ func TestResync_QueuesOnlyActionableTemplates(t *testing.T) {
 		{"mid warmup", []func(*ateapipb.ActorTemplate){withSnapshotDeadline(time.Now().Add(time.Hour))}, true},
 		{"golden snapshot taken", []func(*ateapipb.ActorTemplate){withGoldenTag()}, false},
 		{"failed", []func(*ateapipb.ActorTemplate){withFailed(reasonGoldenActorCrashed)}, false},
+		{"skips golden snapshot", []func(*ateapipb.ActorTemplate){withSkipGoldenSnapshot}, false},
 	}
 
 	// Seed one template per row, resync once, and check membership per row.

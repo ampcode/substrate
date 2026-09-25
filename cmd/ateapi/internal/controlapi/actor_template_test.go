@@ -190,6 +190,19 @@ func TestValidateCreateActorTemplateRequest(t *testing.T) {
 			field.Invalid(field.NewPath("actor_template", "snapshot_config", "on_commit"), "SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED", ""),
 		},
 	}, {
+		"skip_golden_snapshot with cold boot",
+		&ateapipb.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapipb.ActorTemplate) {
+			tmpl.SnapshotConfig.SkipGoldenSnapshot = true
+		})},
+		nil,
+	}, {
+		"skip_golden_snapshot with golden from_data",
+		&ateapipb.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapipb.ActorTemplate) {
+			tmpl.SnapshotConfig.SkipGoldenSnapshot = true
+			tmpl.SnapshotConfig.OnResume.FromData = ateapipb.ResumeSource_RESUME_SOURCE_GOLDEN
+		})},
+		field.ErrorList{field.Invalid(field.NewPath("actor_template", "snapshot_config", "on_resume", "from_data"), "RESUME_SOURCE_GOLDEN", "")},
+	}, {
 		"missing sandbox_config",
 		&ateapipb.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapipb.ActorTemplate) {
 			tmpl.SandboxConfig = nil

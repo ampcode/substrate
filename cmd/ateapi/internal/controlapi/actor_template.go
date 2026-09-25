@@ -340,13 +340,19 @@ func ValidateCustom_SnapshotConfig_StorageLocation(_ context.Context, _ operatio
 	return nil
 }
 
-// ValidateCustom_SnapshotConfig requires on_commit to be a subset of on_pause.
+// ValidateCustom_SnapshotConfig requires on_commit to be a subset of on_pause,
+// and a golden snapshot to exist for on_resume.from_data to name it.
 func ValidateCustom_SnapshotConfig(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *ateapipb.SnapshotConfig) field.ErrorList {
+	var errs field.ErrorList
 	if value.GetOnPause() == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA &&
 		value.GetOnCommit() != ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
-		return field.ErrorList{field.Invalid(fldPath.Child("on_commit"), value.GetOnCommit().String(), "must be a subset of on_pause")}
+		errs = append(errs, field.Invalid(fldPath.Child("on_commit"), value.GetOnCommit().String(), "must be a subset of on_pause"))
 	}
-	return nil
+	if value.GetSkipGoldenSnapshot() &&
+		value.GetOnResume().GetFromData() == ateapipb.ResumeSource_RESUME_SOURCE_GOLDEN {
+		errs = append(errs, field.Invalid(fldPath.Child("on_resume", "from_data"), value.GetOnResume().GetFromData().String(), "requires the golden snapshot that skip_golden_snapshot disables"))
+	}
+	return errs
 }
 
 // envVarNameRE constrains env var names to any printable ASCII character

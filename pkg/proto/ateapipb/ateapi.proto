@@ -896,6 +896,16 @@ message SnapshotConfig {
   // +k8s:maxLength=1024
   // +k8s:customValidation # Validate URI
   string storage_location = 4;
+
+  // skip_golden_snapshot, when true, keeps the template controller from
+  // building the template's golden snapshot. Actors created without a
+  // source_tag then cold-boot from their OCI images, and on_resume.from_data
+  // must not be GOLDEN. Set it when a FULL snapshot of the template is not
+  // wanted: a FULL snapshot binds to the CPU model of the node that took it,
+  // and a large image makes it slow to build and costly to store.
+  //
+  // +k8s:optional
+  bool skip_golden_snapshot = 5;
 }
 
 // ResumeSource selects what supplies the guest state when an actor is resumed

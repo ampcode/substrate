@@ -6321,6 +6321,34 @@ func Validate_SnapshotConfig(
 		errs = append(errs, fn(fldPath.Child("storage_location"), &obj.StorageLocation, oldVal, oldObj != nil)...)
 	}
 
+	{ // field ateapipb.SnapshotConfig.SkipGoldenSnapshot
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *bool,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *ateapipb.SnapshotConfig) *bool {
+				return &oldObj.SkipGoldenSnapshot
+			})
+		errs = append(errs, fn(fldPath.Child("skip_golden_snapshot"), &obj.SkipGoldenSnapshot, oldVal, oldObj != nil)...)
+	}
+
 	return errs
 }
 
