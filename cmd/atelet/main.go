@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -60,6 +61,7 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	ecrlogin "github.com/awslabs/amazon-ecr-credential-helper/ecr-login"
 	"github.com/google/go-containerregistry/pkg/authn"
 	googlecontainerauth "github.com/google/go-containerregistry/pkg/v1/google"
 	"github.com/spf13/pflag"
@@ -99,6 +101,7 @@ var (
 	ateapiServerName = pflag.String("ateapi-server-name", "api.ate-system.svc", "DNS name expected on the ateapi certificate.")
 
 	gcpAuthForImagePulls         = pflag.Bool("gcp-auth-for-image-pulls", true, "Use GCP application default credentials mechanism.")
+	ecrAuthForImagePulls         = pflag.Bool("ecr-auth-for-image-pulls", false, "Authenticate pulls from Amazon ECR registries with the AWS SDK default credential chain (IRSA on EKS).")
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateompath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the ateom pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 
@@ -207,8 +210,16 @@ func main() {
 	if err := validateImageCacheGCFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid image cache GC flags", err)
 	}
+	var registryKeychain authn.Keychain
+	if *ecrAuthForImagePulls {
+		// The helper answers only for *.dkr.ecr.*.amazonaws.com and
+		// public.ecr.aws; other registries fall back to anonymous.
+		registryKeychain = authn.NewKeychainFromHelper(ecrlogin.NewECRHelper(ecrlogin.WithLogger(io.Discard)))
+	}
+
 	imageCache, err := imagecache.New(*imageCacheDir,
 		imagecache.WithAuthenticator(gcpRegistryAuthn),
+		imagecache.WithKeychain(registryKeychain),
 		imagecache.WithLocalhostRegistryReplacement(*localhostRegistryReplacement),
 		imagecache.WithActorsDir(ateompath.ActorsDir),
 		imagecache.WithMinAge(*imageCacheMinAge),
