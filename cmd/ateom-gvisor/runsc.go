@@ -94,6 +94,11 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 		// sizing.ApplyToOCISpec, so the sandbox is sized to the pod's limit (runsc
 		// otherwise sizes to all host CPUs). Global flag: before the subcommand.
 		"--cpu-num-from-quota",
+		// Honor setuid/setgid bits on executables inside the sandbox (sudo, su).
+		// gVisor ignores them unless this is set at boot. Privilege gained this
+		// way stays inside the sandbox: it is bounded by the container's
+		// capability set and never reaches the worker pod.
+		"--allow-suid",
 	}
 	args = append(args,
 		"create",
@@ -278,8 +283,10 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		// "-log-packets",
 		// "-strace",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
-		// Match cmdCreate: size the restored sentry from the cgroup CPU quota.
+		// Match cmdCreate: size the restored sentry from the cgroup CPU quota and
+		// keep honoring setuid bits after restore.
 		"--cpu-num-from-quota",
+		"--allow-suid",
 	}
 	restoreArgs = append(restoreArgs,
 		"restore",
