@@ -143,6 +143,12 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 		// "-strace",
 		"-allow-connected-on-save",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
+		// The actor container is a sub-container of the pause sandbox, and gVisor
+		// computes a sub-container's credentials from the config of the `start`
+		// command (runsc/boot/loader.go startSubcontainer -> getRootCredentials),
+		// not the `create` that booted the sandbox. Without this here CAP_NET_RAW
+		// is dropped even though `create` passed it.
+		"--net-raw",
 	}
 	startArgs = append(startArgs, "start", containerName)
 	cmd := exec.CommandContext(ctx, r.path, startArgs...)
