@@ -167,6 +167,26 @@ func HTTPKeySource(issuer string, client *http.Client) KeySource {
 	return httpKeySource{issuer: issuer, client: client}
 }
 
+type jwksURIKeySource struct {
+	issuer  string
+	jwksURI string
+	client  *http.Client
+}
+
+func (s jwksURIKeySource) Keys(ctx context.Context) ([]*KeyAndID, error) {
+	return fetchKeysFromJWKS(ctx, s.client, s.issuer, s.jwksURI)
+}
+
+// JWKSURIKeySource fetches the issuer's keys from jwksURI directly, skipping
+// OIDC discovery. Use it when the issuer URL is not reachable from the
+// verifier but its keys are served elsewhere, such as a Kubernetes API server
+// at https://kubernetes.default.svc/openid/v1/jwks whose service account
+// issuer is an external URL. The Verifier still requires tokens to name issuer
+// in their iss claim; issuer here is only for logs and errors.
+func JWKSURIKeySource(issuer, jwksURI string, client *http.Client) KeySource {
+	return jwksURIKeySource{issuer: issuer, jwksURI: jwksURI, client: client}
+}
+
 // Verifier verifies JWTs from one trusted OIDC issuer and caches its signing
 // keys. Keys are refreshed periodically and, at a bounded rate, when a token
 // names an unknown key ID.
@@ -606,7 +626,13 @@ func discoverKeysForIssuer(ctx context.Context, httpClient *http.Client, issuer 
 
 	slog.InfoContext(ctx, "Fetched discovery doc", slog.Any("doc", oidcConfig))
 
-	jwkSet, err := fetchJSON[jwkSetT](ctx, httpClient, oidcConfig.JWKSURI)
+	return fetchKeysFromJWKS(ctx, httpClient, issuer, oidcConfig.JWKSURI)
+}
+
+// fetchKeysFromJWKS fetches the JWK set at jwksURI and returns its usable
+// keys. issuer names the set's owner in logs and errors only.
+func fetchKeysFromJWKS(ctx context.Context, httpClient *http.Client, issuer, jwksURI string) ([]*KeyAndID, error) {
+	jwkSet, err := fetchJSON[jwkSetT](ctx, httpClient, jwksURI)
 	if err != nil {
 		return nil, fmt.Errorf("while fetching JWKS: %w", err)
 	}

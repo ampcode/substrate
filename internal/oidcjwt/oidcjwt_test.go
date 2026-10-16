@@ -75,6 +75,38 @@ func newTestIssuer(t *testing.T) *testIssuer {
 	return ti
 }
 
+// A verifier with a JWKSURIKeySource verifies tokens from an issuer it cannot
+// reach (the test server is never asked for discovery), and still rejects a
+// token whose iss claim is not the configured issuer.
+func TestVerifierWithJWKSURIKeySourceSkipsDiscovery(t *testing.T) {
+	ti := newTestIssuer(t)
+	key := testRSAKey(t)
+	ti.addRSA("key", &key.PublicKey)
+	const externalIssuer = "https://oidc.eks.us-east-1.amazonaws.com/id/ABCDEF"
+	verifier := NewVerifier(externalIssuer, []string{testAudience}, JWKSURIKeySource(externalIssuer, ti.server.URL+"/jwks", ti.server.Client()))
+	now := time.Now()
+
+	token := mintJWT(t, "RS256", "key", key, validClaims(externalIssuer))
+	claims, err := verifier.Verify(t.Context(), token, now)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if claims.Subject != "system:serviceaccount:ate-system:atelet" {
+		t.Fatalf("Subject = %q", claims.Subject)
+	}
+	if got := ti.discoveryRequests.Load(); got != 0 {
+		t.Fatalf("discovery requests = %d, want 0", got)
+	}
+	if got := ti.jwksRequests.Load(); got != 1 {
+		t.Fatalf("JWKS requests = %d, want 1", got)
+	}
+
+	wrongIssuer := mintJWT(t, "RS256", "key", key, validClaims(ti.issuer()))
+	if _, err := verifier.Verify(t.Context(), wrongIssuer, now); err == nil || !strings.Contains(err.Error(), "unexpected issuer") {
+		t.Fatalf("Verify() with iss %q error = %v, want unexpected issuer", ti.issuer(), err)
+	}
+}
+
 func TestVerifierRetriesInitialDiscoveryFailure(t *testing.T) {
 	ti := newTestIssuer(t)
 	key := testRSAKey(t)
