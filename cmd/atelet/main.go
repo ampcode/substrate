@@ -30,7 +30,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/spf13/pflag"
 	"go.ate.dev/substrate/cmd/atelet/internal/apivalidation"
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
@@ -106,6 +105,7 @@ var (
 	// no cloud SDK compiled in, on any cloud whose nodes configure a provider.
 	imageCredentialProviderConfig = pflag.String("image-credential-provider-config", "", "Path to a kubelet CredentialProviderConfig. Its exec plugins supply image pull credentials; without it, pulls are anonymous.")
 	imageCredentialProviderBinDir = pflag.String("image-credential-provider-bin-dir", "", "Directory holding the credential provider executables named by --image-credential-provider-config. Required when that flag is set.")
+	dockerConfigAuthForImagePulls = pflag.Bool("docker-config-auth-for-image-pulls", true, "Authenticate image pulls with the Docker config file ($DOCKER_CONFIG/config.json, else $HOME/.docker/config.json), the format of a kubernetes.io/dockerconfigjson Secret, before the credential providers. Registries the file has no entry for fall through to them.")
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
@@ -129,8 +129,6 @@ var (
 	snapshotReportWorkers     = pflag.Int("snapshot-report-workers", snapshottracker.DefaultReportWorkers, "How many background snapshot state reports atelet runs at once. 0 disables background reporting.")
 	snapshotReportGiveUpAfter = pflag.Duration("snapshot-report-give-up-after", snapshottracker.DefaultReportGiveUpAfter, "How long after a background upload or detach atelet keeps retrying a failed snapshot state report before giving up on it.")
 )
-
-var _ imagecache.CandidateKeychain = (*credentialprovider.Keychain)(nil)
 
 func main() {
 	pflag.Parse()
@@ -227,9 +225,10 @@ func main() {
 
 	workerDialer := newWorkerDialer(256)
 
-	// Without a credential provider config, pulls are anonymous: all an
-	// unconfigured node (kind, say) can do and all a public registry needs.
-	var imageCredsKeychain authn.Keychain
+	// Without a credential provider config or a Docker config file, pulls are
+	// anonymous: all an unconfigured node (kind, say) can do and all a public
+	// registry needs.
+	var providers imagecache.CandidateKeychain
 	if *imageCredentialProviderConfig != "" {
 		if *imageCredentialProviderBinDir == "" {
 			serverboot.Fatal(ctx, "Failed to configure image pull credentials",
@@ -239,8 +238,9 @@ func main() {
 		if err != nil {
 			serverboot.Fatal(ctx, "Failed to configure image pull credentials", err)
 		}
-		imageCredsKeychain = kc
+		providers = kc
 	}
+	imageCredsKeychain := newRegistryKeychain(*dockerConfigAuthForImagePulls, providers)
 
 	if err := validateImageCacheGCFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid image cache GC flags", err)
