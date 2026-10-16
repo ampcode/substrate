@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/aws/smithy-go"
 	"go.ate.dev/substrate/internal/resources"
 	"golang.org/x/sync/errgroup"
@@ -99,7 +100,10 @@ func isMissingBucket(err error) bool {
 		return true
 	}
 	var apiErr smithy.APIError
-	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket"
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket" {
+		return true
+	}
+	return bloberror.HasCode(err, bloberror.ContainerNotFound)
 }
 
 // CopyPrefix copies every object of the external snapshot at src to dst,

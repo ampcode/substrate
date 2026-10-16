@@ -24,10 +24,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// UsesS3 reports whether ATE_STORAGE_BACKEND selects S3. Any other value
-// selects GCS, the default.
+// UsesS3 reports whether ATE_STORAGE_BACKEND selects S3. Any value other
+// than "s3" or "azblob" selects GCS, the default.
 func UsesS3() bool {
 	return os.Getenv("ATE_STORAGE_BACKEND") == "s3"
+}
+
+// UsesAzureBlob reports whether ATE_STORAGE_BACKEND selects Azure Blob
+// Storage, in the storage account AZURE_STORAGE_ACCOUNT names.
+func UsesAzureBlob() bool {
+	return os.Getenv("ATE_STORAGE_BACKEND") == "azblob"
 }
 
 // NewS3ClientFromEnv builds an S3 client from the standard AWS environment
@@ -47,7 +53,8 @@ func NewS3ClientFromEnv(ctx context.Context) (*s3.Client, error) {
 	}), nil
 }
 
-// NewFromEnv builds the ObjectStorage for the backend UsesS3 selects.
+// NewFromEnv builds the ObjectStorage for the backend UsesS3 or UsesAzureBlob
+// selects.
 func NewFromEnv(ctx context.Context) (ObjectStorage, error) {
 	if UsesS3() {
 		client, err := NewS3ClientFromEnv(ctx)
@@ -55,6 +62,13 @@ func NewFromEnv(ctx context.Context) (ObjectStorage, error) {
 			return nil, err
 		}
 		return NewS3Client(client), nil
+	}
+	if UsesAzureBlob() {
+		client, err := NewAzureBlobClientFromEnv(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return NewAzureBlobClient(client), nil
 	}
 	// GCS is currently the default, TODO: we assume workload identity / ADC
 	client, err := NewGCSClient(ctx)
