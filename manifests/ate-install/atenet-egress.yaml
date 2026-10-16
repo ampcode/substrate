@@ -1003,6 +1003,21 @@ data:
             - endpoint:
                 address:
                   pipe: {path: /var/run/sdsmint/sdsmint.sock}
+      # ext_proc_server and every forwarding cluster below carry the same
+      # explicit circuit breaker. Without one Envoy applies its default of 1024
+      # connections, pending requests and requests per cluster. Every tunnel
+      # through mitm_internal above ends on one of these clusters (one
+      # connection per passthrough or cleartext tunnel, one request per
+      # decrypted request on the MITM leg, one ext_proc stream per request
+      # being classified, with failure_mode_allow false), and every actor
+      # behind this gateway shares those pools, so at ~1000 concurrent tunnels
+      # the default tripped: CONNECTs got 503 UO regardless of destination and
+      # established tunnels were closed with UO on the inner leg, which the
+      # actor saw as a TLS handshake EOF. A few dozen actors running a package
+      # install at once is enough to get there. The numbers sit above
+      # mitm_internal's 16384 so the breaker that trips first is the one
+      # documented there; the gateway's real ceiling is its file descriptors
+      # and memory.
       # ext_proc gRPC server = the atenet router, co-located in this pod as a
       # sidecar and called over localhost (same topology the ingress gateway uses
       # for its dataplane + ext_proc).
@@ -1010,6 +1025,12 @@ data:
         type: STATIC
         lb_policy: ROUND_ROBIN
         connect_timeout: 1s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -1030,6 +1051,12 @@ data:
       - name: egress_forward_proxy
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         cluster_type:
           name: envoy.clusters.dynamic_forward_proxy
           typed_config:
@@ -1065,6 +1092,12 @@ data:
       - name: egress_forward_proxy_grpc
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         cluster_type:
           name: envoy.clusters.dynamic_forward_proxy
           typed_config:
@@ -1101,6 +1134,12 @@ data:
       - name: egress_forward_proxy_cleartext
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         cluster_type:
           name: envoy.clusters.dynamic_forward_proxy
           typed_config:
@@ -1132,6 +1171,12 @@ data:
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -1153,6 +1198,12 @@ data:
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -1178,6 +1229,12 @@ data:
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -1192,6 +1249,12 @@ data:
       - name: egress_forward_proxy_passthrough
         lb_policy: CLUSTER_PROVIDED
         connect_timeout: 5s
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 32768
+            max_pending_requests: 32768
+            max_requests: 32768
         cluster_type:
           name: envoy.clusters.dynamic_forward_proxy
           typed_config:
