@@ -44,6 +44,10 @@ type LoadOptions struct {
 	ConfigPath string
 	// NoDevEnv skips sourcing .ate-dev-env.sh even when it exists.
 	NoDevEnv bool
+	// NoRepo loads the configuration without a repository checkout: Root
+	// stays empty and .ate-dev-env.sh is not sourced. For commands that run
+	// in-cluster, such as bootstrap, and never read a manifest.
+	NoRepo bool
 }
 
 // LoadFlags resolves the effective configuration from a bound flag set.
@@ -53,9 +57,12 @@ type LoadOptions struct {
 // is the artifact an operator owns and reviews; ambient state must not silently
 // outrank it.
 func LoadFlags(fs *pflag.FlagSet, o LoadOptions) (*Config, error) {
-	root, err := RepoRoot()
-	if err != nil {
-		return nil, err
+	var root string
+	if !o.NoRepo {
+		var err error
+		if root, err = RepoRoot(); err != nil {
+			return nil, err
+		}
 	}
 
 	env := environ()
@@ -65,13 +72,14 @@ func LoadFlags(fs *pflag.FlagSet, o LoadOptions) (*Config, error) {
 	// nothing here depends on the environment it precedes.
 	var file *File
 	if path := configPathFrom(o); path != "" {
+		var err error
 		if file, err = ParseFile(path); err != nil {
 			return nil, err
 		}
 	}
 
 	kind := resolveKind(fs, file, env)
-	if err := mergeDevEnv(root, env, o.NoDevEnv, kind); err != nil {
+	if err := mergeDevEnv(root, env, o.NoDevEnv || o.NoRepo, kind); err != nil {
 		return nil, err
 	}
 
