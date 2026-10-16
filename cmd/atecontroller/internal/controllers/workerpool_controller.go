@@ -57,6 +57,10 @@ type WorkerPoolReconciler struct {
 	client.Client
 	Scheme       *runtime.Scheme
 	OTelEndpoint string
+	// PKIDelivery selects projected volumes or the podcert-agent sidecar for
+	// worker pods; PodcertAgentImage is the sidecar image in agent mode.
+	PKIDelivery       PKIDelivery
+	PodcertAgentImage string
 	// OTelMetricExportInterval is the OTEL_METRIC_EXPORT_INTERVAL propagated to
 	// worker pods. Empty keeps the SDK's default.
 	OTelMetricExportInterval string
@@ -332,7 +336,10 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		TracesSampler:        r.OTelTracesSampler,
 		TracesSamplerArg:     r.OTelTracesSamplerArg,
 		LogsExporter:         r.OTelLogsExporter,
-	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount, r.DNSEgressPolicy)
+	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount, r.DNSEgressPolicy, workerPKISettings{
+		Delivery:   r.PKIDelivery,
+		AgentImage: r.PodcertAgentImage,
+	})
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
