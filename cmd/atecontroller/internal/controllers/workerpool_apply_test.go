@@ -224,7 +224,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDeploymentApplyConfig(tt.wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
+			got := buildDeploymentApplyConfig(tt.wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{})
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("buildDeploymentApplyConfig() mismatch (-want +got):\n%s", diff)
 			}
@@ -244,7 +244,7 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 		},
 	})
 
-	got := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
+	got := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{})
 	wantLabels := map[string]string{
 		"project":             "agent-substrate",
 		"team":                "compute",
@@ -302,7 +302,7 @@ func TestSandboxClassToleration(t *testing.T) {
 				}},
 			})
 			wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
-			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec
 
 			var classValues []string
 			hasTemplateToleration := false
@@ -332,6 +332,70 @@ func TestSandboxClassToleration(t *testing.T) {
 	}
 }
 
+// TestAgentPKIPodShape asserts agent delivery swaps the two projected PKI
+// volumes for sidecar-fed emptyDirs without moving anything the worker
+// container sees: same volume names, same mount paths, same file names.
+func TestAgentPKIPodShape(t *testing.T) {
+	const image = "example.com/podcert-agent@sha256:abc"
+	ps := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel,
+		workerPKISettings{Delivery: PKIDeliveryAgent, AgentImage: image}).Spec.Template.Spec
+
+	vols := map[string]corev1ac.VolumeApplyConfiguration{}
+	for _, v := range ps.Volumes {
+		vols[*v.Name] = v
+	}
+	for _, name := range []string{atunnelIdentityVolume, atunnelEgressTrustVolume} {
+		v, ok := vols[name]
+		if !ok {
+			t.Fatalf("volume %s missing", name)
+		}
+		if v.Projected != nil || v.EmptyDir == nil || v.EmptyDir.Medium == nil || *v.EmptyDir.Medium != corev1.StorageMediumMemory {
+			t.Errorf("volume %s should be a tmpfs emptyDir in agent mode, got %+v", name, v.VolumeSourceApplyConfiguration)
+		}
+	}
+	if v, ok := vols["podcert-token"]; !ok || v.Projected == nil || *v.Projected.Sources[0].ServiceAccountToken.Audience != "podcert.ate.dev" {
+		t.Errorf("podcert-token volume must be a projected token for audience podcert.ate.dev, got %+v", v)
+	}
+	if v, ok := vols["podcert-trust"]; !ok || v.ConfigMap == nil || *v.ConfigMap.Name != "podcert-trust-bundles" {
+		t.Errorf("podcert-trust volume must mount ConfigMap podcert-trust-bundles, got %+v", v)
+	}
+
+	if len(ps.InitContainers) != 1 {
+		t.Fatalf("want one init container, got %d", len(ps.InitContainers))
+	}
+	agent := ps.InitContainers[0]
+	if *agent.Name != "podcert-agent" || *agent.Image != image {
+		t.Errorf("sidecar = %s/%s", *agent.Name, *agent.Image)
+	}
+	if agent.RestartPolicy == nil || *agent.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("sidecar must be a native sidecar (restartPolicy: Always)")
+	}
+	if agent.StartupProbe == nil || agent.StartupProbe.Exec == nil || agent.StartupProbe.Exec.Command[1] != "--check" {
+		t.Errorf("sidecar needs a --check startupProbe so worker waits for the files, got %+v", agent.StartupProbe)
+	}
+	wantArgs := []string{
+		"--cert=podidentity.podcert.ate.dev/identity=/out/identity",
+		"--trust=servicedns.podcert.ate.dev/identity=/out/egress-trust",
+	}
+	if diff := cmp.Diff(wantArgs, agent.Args); diff != "" {
+		t.Errorf("sidecar args mismatch (-want +got):\n%s", diff)
+	}
+
+	// The worker container is untouched.
+	worker := ps.Containers[0]
+	mounts := map[string]string{}
+	for _, m := range worker.VolumeMounts {
+		mounts[*m.Name] = *m.MountPath
+	}
+	if mounts[atunnelIdentityVolume] != atunnelIdentityMountPath || mounts[atunnelEgressTrustVolume] != atunnelEgressTrustMountPath {
+		t.Errorf("worker mounts changed: %v", mounts)
+	}
+	projected := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec.Containers[0]
+	if diff := cmp.Diff(projected, worker); diff != "" {
+		t.Errorf("worker container differs between delivery modes (-projected +agent):\n%s", diff)
+	}
+}
+
 // TestMicroVMPodShape asserts the micro-VM sandbox class requests the host
 // devices as extended resources (served by atelet's device plugin) and
 // bind-mounts the tun device; other classes get none of it. Placement comes
@@ -350,7 +414,7 @@ func TestMicroVMPodShape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
-			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec
 
 			// /dev/kvm must come from the device plugin, never a hostPath: a
 			// hostPath mount carries no cgroup device allow rule, and the
@@ -437,7 +501,7 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 		},
 	})
 	wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: atev1.SandboxClassMicroVM}}
-	c := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec.Containers[0]
+	c := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec.Containers[0]
 
 	if got, ok := deviceLimit(c, string(corev1.ResourceMemory)); !ok || got != "2Gi" {
 		t.Errorf("memory limit = %q (present=%v), want 2Gi", got, ok)
@@ -470,7 +534,7 @@ func TestWorkerSecurityContextByClass(t *testing.T) {
 			if tt.class != "" {
 				wp.Spec.SandboxClasses = []atev1.WorkerPoolSandboxClass{{Name: tt.class}}
 			}
-			sc := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec.Containers[0].SecurityContext
+			sc := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec.Containers[0].SecurityContext
 			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
 				t.Errorf("AllowPrivilegeEscalation = %v, want false for every class", sc.AllowPrivilegeEscalation)
 			}
@@ -509,7 +573,7 @@ func TestWorkerSecurityContextByClass(t *testing.T) {
 // TestTerminationGracePeriodSeconds asserts the pod's grace period is hardcoded to 3600s.
 func TestTerminationGracePeriodSeconds(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec.Template.Spec
+	ps := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec.Template.Spec
 	if ps.TerminationGracePeriodSeconds == nil {
 		t.Fatalf("TerminationGracePeriodSeconds not set")
 	}
@@ -523,7 +587,7 @@ func TestTerminationGracePeriodSeconds(t *testing.T) {
 // actors' drain window.
 func TestRolloutStrategy(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	spec := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).Spec
+	spec := buildDeploymentApplyConfig(wp, workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).Spec
 	if spec.Strategy == nil || spec.Strategy.RollingUpdate == nil {
 		t.Fatalf("Strategy.RollingUpdate not set")
 	}
@@ -558,7 +622,7 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{Endpoint: tt.endpoint}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{Endpoint: tt.endpoint}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 
@@ -639,7 +703,7 @@ func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
@@ -696,7 +760,7 @@ func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"} {
@@ -731,7 +795,7 @@ func TestBuildDeploymentApplyConfigTracesExporterPropagation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			got, ok := envByName(c.Env)["OTEL_TRACES_EXPORTER"]
 			if ok != tt.wantSet || got.value != tt.want {
@@ -758,7 +822,7 @@ func TestBuildDeploymentApplyConfigMetricsExporterPropagation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			got, ok := envByName(c.Env)["OTEL_METRICS_EXPORTER"]
 			if ok != tt.wantSet || got.value != tt.want {
@@ -1020,7 +1084,7 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 func TestBuildDeploymentAtunnelIdentitiesRelocatedNamespace(t *testing.T) {
 	const relocated = "substrate-test"
 
-	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, relocated, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, relocated, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 		Spec.Template.Spec.Containers[0]
 
 	want := map[string]string{
@@ -1055,7 +1119,7 @@ func TestBuildDeploymentAtunnelIdentitiesPrefixedServiceAccounts(t *testing.T) {
 		router    = "kagent-atenet-router"
 	)
 
-	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, namespace, atelet, router, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, namespace, atelet, router, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 		Spec.Template.Spec.Containers[0]
 
 	want := map[string]string{
@@ -1081,7 +1145,7 @@ func TestBuildDeploymentAtunnelIdentitiesPrefixedServiceAccounts(t *testing.T) {
 // passing it would crashloop that pool's workers.
 func TestBuildDeploymentOmitsBrokerIdentityForCanonicalInstall(t *testing.T) {
 	c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{},
-		installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+		installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 		Spec.Template.Spec.Containers[0]
 
 	for _, arg := range c.Args {
@@ -1107,7 +1171,7 @@ func TestBuildDeploymentOmitsBrokerIdentityForCanonicalInstall(t *testing.T) {
 // pool from the label the controller puts on the pod, so the usage records
 // name the pool the pod belongs to.
 func TestBuildDeploymentApplyConfigWorkerPoolEnv(t *testing.T) {
-	d := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel)
+	d := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{}, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{})
 	c := d.Spec.Template.Spec.Containers[0]
 	var path string
 	for _, e := range c.Env {
@@ -1138,7 +1202,7 @@ func TestBuildDeploymentApplyConfigLogsExporter(t *testing.T) {
 		{"set without endpoint", workerOTelSettings{LogsExporter: "otlp"}, "otlp"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			got, ok := envByName(c.Env)["OTEL_LOGS_EXPORTER"]
 			if ok != (tt.want != "") || (ok && got.value != tt.want) {
@@ -1162,7 +1226,7 @@ func TestBuildDeploymentPreview(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			preview.InitForTestFake(t, []preview.Gate{"Fake", "Phony"}, tc.gates...)
 			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), workerOTelSettings{},
-				installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel).
+				installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount, egresspolicy.DNSEgressPolicyEnforceInAtunnel, workerPKISettings{}).
 				Spec.Template.Spec.Containers[0]
 			var got []string
 			for _, arg := range c.Args {
