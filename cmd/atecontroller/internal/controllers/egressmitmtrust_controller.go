@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"go.ate.dev/substrate/internal/clustertrustbundle"
+	"go.ate.dev/substrate/internal/egressmitmtrust"
 	"go.ate.dev/substrate/internal/localca"
 	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	certsv1ac "k8s.io/client-go/applyconfigurations/certificates/v1"
 	certsv1beta1ac "k8s.io/client-go/applyconfigurations/certificates/v1beta1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -40,14 +42,45 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// EgressMITMTrustReconciler derives a ClusterTrustBundle from the egress MITM
-// CA pool.
+// EgressMITMTrustSink selects the object the egress MITM trust bundle is
+// published as.
+type EgressMITMTrustSink string
+
+const (
+	// EgressMITMTrustSinkClusterTrustBundle publishes a certificates.k8s.io
+	// ClusterTrustBundle (projected PKI delivery: GKE, kind).
+	EgressMITMTrustSinkClusterTrustBundle EgressMITMTrustSink = "clustertrustbundle"
+	// EgressMITMTrustSinkConfigMap publishes ConfigMap
+	// ate-system/egress-mitm-trust (agent PKI delivery: clusters without the
+	// certificates.k8s.io ClusterTrustBundle API). atelet reads whichever its
+	// --egress-mitm-trust-source flag names.
+	EgressMITMTrustSinkConfigMap EgressMITMTrustSink = "configmap"
+)
+
+// ParseEgressMITMTrustSink validates an --egress-mitm-trust-sink flag value.
+func ParseEgressMITMTrustSink(s string) (EgressMITMTrustSink, error) {
+	switch EgressMITMTrustSink(s) {
+	case EgressMITMTrustSinkClusterTrustBundle, EgressMITMTrustSinkConfigMap:
+		return EgressMITMTrustSink(s), nil
+	case "":
+		return EgressMITMTrustSinkClusterTrustBundle, nil
+	}
+	return "", fmt.Errorf("unknown egress MITM trust sink %q; want %s or %s", s, EgressMITMTrustSinkClusterTrustBundle, EgressMITMTrustSinkConfigMap)
+}
+
+// EgressMITMTrustReconciler derives the egress MITM trust bundle (a
+// ClusterTrustBundle or a ConfigMap, per Sink) from the egress MITM CA pool.
 type EgressMITMTrustReconciler struct {
 	client.Client
 
 	// SystemNamespace is the namespace holding the egress MITM CA pool Secret.
 	SystemNamespace string
-	bundleV1        bool
+
+	// Sink selects whether the bundle is published as a ClusterTrustBundle or
+	// a ConfigMap.
+	Sink EgressMITMTrustSink
+
+	bundleV1 bool
 }
 
 // EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway
@@ -58,6 +91,7 @@ func EgressMITMCAPoolRef(systemNamespace string) types.NamespacedName {
 }
 
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=certificates.k8s.io,resources=clustertrustbundles,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=egress-mitm.ate.dev/*,verbs=attest
 
@@ -85,32 +119,56 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, fmt.Errorf("failed to derive the egress MITM trust bundle from %q: %w", req.NamespacedName, err)
 	}
 
-	ctbAC := buildEgressMITMTrustBundleApplyConfig(trustBundle)
-	var applyConfig runtime.ApplyConfiguration = ctbAC
-	if !r.bundleV1 {
-		applyConfig = certsv1beta1ac.ClusterTrustBundle(egressMITMTrustBundleName).
-			WithLabels(ctbAC.Labels).
-			WithSpec(certsv1beta1ac.ClusterTrustBundleSpec().WithSignerName(egressMITMSignerName).WithTrustBundle(trustBundle))
-	}
-
 	// Server-side apply rather than get-then-update: it creates and updates
 	// through one call, and it reverts hand edits to the fields owned here
 	// without clobbering anything a different manager legitimately set.
 	const egressMITMTrustFieldOwner = "ate-egress-mitm-trust"
-	if err := r.Apply(ctx, applyConfig, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err)
+	var name string
+	if r.Sink == EgressMITMTrustSinkConfigMap {
+		cmAC := buildEgressMITMTrustConfigMapApplyConfig(trustBundle)
+		if err := r.Apply(ctx, cmAC, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to apply ConfigMap %s/%s: %w", *cmAC.Namespace, *cmAC.Name, err)
+		}
+		name = "ConfigMap " + *cmAC.Namespace + "/" + *cmAC.Name
+	} else {
+		ctbAC := buildEgressMITMTrustBundleApplyConfig(trustBundle)
+		var applyConfig runtime.ApplyConfiguration = ctbAC
+		if !r.bundleV1 {
+			applyConfig = certsv1beta1ac.ClusterTrustBundle(egressMITMTrustBundleName).
+				WithLabels(ctbAC.Labels).
+				WithSpec(certsv1beta1ac.ClusterTrustBundleSpec().WithSignerName(egressMITMSignerName).WithTrustBundle(trustBundle))
+		}
+		if err := r.Apply(ctx, applyConfig, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err)
+		}
+		name = "ClusterTrustBundle " + *ctbAC.Name
 	}
 	log.Info("reconciled the egress MITM trust bundle",
-		"name", *ctbAC.Name,
+		"name", name,
 		"secret", req.NamespacedName.String())
 
 	return ctrl.Result{}, nil
 }
 
 // egressMITMSignerName identifies the MITM CA's trust domain.
-const egressMITMSignerName = "egress-mitm.ate.dev/mitm"
+const egressMITMSignerName = egressmitmtrust.SignerName
 
-const egressMITMTrustBundleName = "egress-mitm.ate.dev:mitm:primary-bundle"
+const egressMITMTrustBundleName = egressmitmtrust.ClusterTrustBundleName
+
+// egressMITMTrustConfigMapRef locates the ConfigMap sink.
+func egressMITMTrustConfigMapRef() types.NamespacedName {
+	return types.NamespacedName{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName}
+}
+
+func buildEgressMITMTrustConfigMapApplyConfig(trustBundle string) *corev1ac.ConfigMapApplyConfiguration {
+	ref := egressMITMTrustConfigMapRef()
+	return corev1ac.ConfigMap(ref.Name, ref.Namespace).
+		WithLabels(map[string]string{
+			"podcert.ate.dev/canarying": "live",
+			"podcert.ate.dev/signer":    egressMITMSignerName,
+		}).
+		WithData(map[string]string{egressmitmtrust.ConfigMapKey: trustBundle})
+}
 
 func buildEgressMITMTrustBundleApplyConfig(trustBundle string) *certsv1ac.ClusterTrustBundleApplyConfiguration {
 	return certsv1ac.ClusterTrustBundle(egressMITMTrustBundleName).
@@ -155,6 +213,25 @@ func egressMITMTrustBundlePEM(secret *corev1.Secret) (string, error) {
 func (r *EgressMITMTrustReconciler) deleteTrustBundle(ctx context.Context) error {
 	log := log.FromContext(ctx)
 
+	if r.Sink == EgressMITMTrustSinkConfigMap {
+		ref := egressMITMTrustConfigMapRef()
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, ref, cm); err != nil {
+			if k8errors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("failed to get ConfigMap %s: %w", ref, err)
+		}
+		if cm.Labels["podcert.ate.dev/signer"] != egressMITMSignerName {
+			return fmt.Errorf("refusing to delete ConfigMap %s: not labelled as the %s trust bundle", ref, egressMITMSignerName)
+		}
+		if err := r.Delete(ctx, cm, client.Preconditions{UID: &cm.UID}); err != nil && !k8errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete ConfigMap %s: %w", ref, err)
+		}
+		log.Info("deleted the egress MITM trust bundle; its CA pool is gone", "name", "ConfigMap "+ref.String())
+		return nil
+	}
+
 	obj := r.bundleObject()
 	if err := r.Get(ctx, types.NamespacedName{Name: egressMITMTrustBundleName}, obj); err != nil {
 		if k8errors.IsNotFound(err) {
@@ -190,32 +267,41 @@ func (r *EgressMITMTrustReconciler) bundleObject() client.Object {
 }
 
 func (r *EgressMITMTrustReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	disco, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
-	if err != nil {
-		return err
-	}
-	gv, err := clustertrustbundle.Discover(disco)
-	if err != nil {
-		return err
-	}
-	r.bundleV1 = gv == certsv1.SchemeGroupVersion
-
 	poolRef := EgressMITMCAPoolRef(r.SystemNamespace)
 
 	// The pool Secret is the only object reconciled from. The bundle is watched
 	// as well so that deleting or hand-editing the derived object is reverted
-	// rather than silently accepted.
-	return ctrl.NewControllerManagedBy(mgr).
+	// rather than silently accepted. Only the selected sink is watched (and,
+	// for ClusterTrustBundles, discovered): on a cluster without the
+	// certificates.k8s.io API a ClusterTrustBundle informer would never sync.
+	enqueuePool := handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
+		return []reconcile.Request{{NamespacedName: poolRef}}
+	})
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("egressmitmtrust").
 		For(&corev1.Secret{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetNamespace() == poolRef.Namespace && obj.GetName() == poolRef.Name
-		}))).
-		Watches(r.bundleObject(),
-			handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
-				return []reconcile.Request{{NamespacedName: poolRef}}
-			}),
+		})))
+	if r.Sink == EgressMITMTrustSinkConfigMap {
+		cmRef := egressMITMTrustConfigMapRef()
+		b = b.Watches(&corev1.ConfigMap{}, enqueuePool,
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetNamespace() == cmRef.Namespace && obj.GetName() == cmRef.Name
+			})))
+	} else {
+		disco, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+		if err != nil {
+			return err
+		}
+		gv, err := clustertrustbundle.Discover(disco)
+		if err != nil {
+			return err
+		}
+		r.bundleV1 = gv == certsv1.SchemeGroupVersion
+		b = b.Watches(r.bundleObject(), enqueuePool,
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 				return obj.GetName() == egressMITMTrustBundleName
-			}))).
-		Complete(r)
+			})))
+	}
+	return b.Complete(r)
 }
