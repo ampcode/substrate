@@ -44,6 +44,7 @@ import (
 	"go.ate.dev/substrate/internal/ateworker/phaselog"
 	"go.ate.dev/substrate/internal/ateworker/pid1"
 	"go.ate.dev/substrate/internal/ateworker/register"
+	"go.ate.dev/substrate/internal/ateworker/suspend"
 	"go.ate.dev/substrate/internal/ateworker/tunnel"
 	"go.ate.dev/substrate/internal/ateworkervalidation"
 	"go.ate.dev/substrate/internal/imagecache"
@@ -99,6 +100,16 @@ const minUsageSampleInterval = 50 * time.Second
 // for the ateworker, so the escalation to SIGKILL happens here rather than as a
 // kubelet SIGKILL of ateworker itself.
 const workloadGracePeriod = 30 * time.Minute
+
+// suspendGracePeriod is how long shutdown waits for the control plane to
+// suspend the actors this worker hosts before stopping them itself. A worker
+// pod leaving (a WorkerPool roll, a node drain) is not the actor's fault, so
+// the actor is checkpointed and later resumes elsewhere with its state instead
+// of ending CRASHED. The suspend travels ateworker -> atelet -> ateapi and
+// comes back as a CheckpointWorkload into this process, which is why that RPC
+// is allowed while draining. Sized for a multi-GiB checkpoint and upload on a
+// loaded node, and well inside workloadGracePeriod.
+const suspendGracePeriod = 10 * time.Minute
 
 func main() {
 	pid1.RunIfPID1()
@@ -239,6 +250,19 @@ func do(ctx context.Context) error {
 	}
 	ateworkerService := NewService(tunnel, actorLogger, *maxActors, flags)
 	ateworkerService.cgroupDelegated = cgroupDelegated
+
+	// Shutdown asks the control plane to suspend the hosted actors through the
+	// node-local atelet, with the same credentials capacity reporting uses.
+	suspendRequester, err := suspend.NewRequester(suspend.Config{
+		SocketPath:           nodepath.WorkerSupportSocket,
+		CredentialBundlePath: tunnelConfig.CredentialBundle,
+		TrustBundlePath:      tunnelConfig.TrustBundle,
+		AteletSPIFFEID:       tunnelConfig.BrokerIdentity,
+	})
+	if err != nil {
+		return err
+	}
+	ateworkerService.suspendRequester = suspendRequester
 	// The controller sets both from the downward API.
 	pool := workerstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -343,6 +367,10 @@ type AteWorkerService struct {
 	// workload RPCs are rejected with codes.Unavailable.
 	shuttingDown atomic.Bool
 
+	// suspendRequester asks the control plane to suspend hosted actors when the
+	// worker shuts down. nil skips the request and stops the actors directly.
+	suspendRequester suspendRequester
+
 	// cgroupRoot is where the sandbox's cgroup v2 leaves live: the worker pod's
 	// own cgroup scope, which cgroup.Delegate prepares. A field rather
 	// than a constant so tests can point GetWorkloadStats at a fixture tree.
@@ -363,6 +391,13 @@ type AteWorkerService struct {
 }
 
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
+
+// suspendRequester is the slice of *suspend.Requester shutdown needs. Narrowed
+// to an interface so that code can be exercised without a socket or
+// certificates.
+type suspendRequester interface {
+	RequestSuspend(ctx context.Context, actor suspend.Actor) error
+}
 
 // NewService creates a new AteWorkerService.
 func NewService(tunnel *tunnel.Tunnel, actorLogger *actorlog.ActorLogger, maxActors int, flags *flagStore) *AteWorkerService {
@@ -428,12 +463,25 @@ func (s *AteWorkerService) gracefulShutdown(ctx context.Context) {
 		slog.ErrorContext(ctx, "Giving up waiting for in-flight RPCs during graceful shutdown",
 			slog.Any("rpcs", s.inFlight.Names()))
 	}
+
+	// Actors still running get a chance to be suspended rather than stopped.
+	// A suspend that lands runs CheckpointWorkload here, which unhosts the
+	// actor, so what is left afterwards is what nobody suspended.
+	s.suspendHostedActors(ctx, deadline)
+	// A checkpoint the control plane started but did not answer for in time is
+	// still saving state; stopping its containers now would corrupt it.
+	if !s.inFlight.WaitIdle(waitCtx) {
+		slog.ErrorContext(ctx, "Giving up waiting for in-flight RPCs after requesting suspends",
+			slog.Any("rpcs", s.inFlight.Names()))
+	}
 	sessions := s.hostedSessions()
 
 	if len(sessions) == 0 {
 		slog.InfoContext(ctx, "No active workload at shutdown; exiting cleanly")
 		return
 	}
+	slog.WarnContext(ctx, "Stopping workloads the control plane did not suspend",
+		slog.Int("workloads", len(sessions)))
 
 	// The kill below ends every activation still hosted. Read each while its
 	// sandbox runs, and write its final record once the containers are gone.
@@ -460,6 +508,56 @@ func (s *AteWorkerService) gracefulShutdown(ctx context.Context) {
 	}
 
 	slog.InfoContext(ctx, "Shutting down")
+}
+
+// suspendHostedActors asks the control plane to suspend every actor with
+// running containers, in parallel, and returns once each request has been
+// answered or suspendGracePeriod has passed. The shared drain deadline still
+// applies if it is sooner. Requests that fail are logged; the caller stops
+// whatever is left running.
+func (s *AteWorkerService) suspendHostedActors(ctx context.Context, deadline time.Time) {
+	if s.suspendRequester == nil {
+		return
+	}
+	running := s.runningActors()
+	if len(running) == 0 {
+		return
+	}
+	if suspendDeadline := time.Now().Add(suspendGracePeriod); suspendDeadline.Before(deadline) {
+		deadline = suspendDeadline
+	}
+	suspendCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, hosted := range running {
+		actor := suspend.Actor{
+			Atespace: hosted.attribution.Ref.Atespace,
+			Name:     hosted.attribution.Ref.Name,
+			UID:      hosted.attribution.UID,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slog.InfoContext(ctx, "Asking the control plane to suspend a hosted actor before shutdown",
+				slog.String("actor", hosted.attribution.Ref.String()),
+				slog.String("actorUID", actor.UID))
+			started := time.Now()
+			if err := s.suspendRequester.RequestSuspend(suspendCtx, actor); err != nil {
+				slog.WarnContext(ctx, "The control plane did not suspend a hosted actor before shutdown",
+					slog.String("actor", hosted.attribution.Ref.String()),
+					slog.String("actorUID", actor.UID),
+					slog.Duration("waited", time.Since(started)),
+					slog.Any("err", err))
+				return
+			}
+			slog.InfoContext(ctx, "Suspended a hosted actor before shutdown",
+				slog.String("actor", hosted.attribution.Ref.String()),
+				slog.String("actorUID", actor.UID),
+				slog.Duration("took", time.Since(started)))
+		}()
+	}
+	wg.Wait()
 }
 
 // containerKillTimeout bounds the post-SIGKILL wait, so a completely broken
