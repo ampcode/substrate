@@ -17,6 +17,7 @@ package objectstorage
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,14 +26,19 @@ func TestNewFromEnv(t *testing.T) {
 		name          string
 		backend       string
 		pathStyle     string
+		account       string
 		wantS3        bool
+		wantAzure     bool
 		wantPathStyle bool
+		wantErr       string
 	}{
 		{name: "unset selects GCS", backend: ""},
 		{name: "unknown value selects GCS", backend: "gcs"},
 		{name: "s3", backend: "s3", wantS3: true},
 		{name: "s3 with path style", backend: "s3", pathStyle: "true", wantS3: true, wantPathStyle: true},
 		{name: "s3 path style needs exactly true", backend: "s3", pathStyle: "1", wantS3: true},
+		{name: "azblob", backend: "azblob", account: "substrate", wantAzure: true},
+		{name: "azblob needs the storage account", backend: "azblob", wantErr: "AZURE_STORAGE_ACCOUNT"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// GCS: the emulator host makes storage.NewClient skip credential lookup.
@@ -46,8 +52,15 @@ func TestNewFromEnv(t *testing.T) {
 			t.Setenv("AWS_REGION", "us-east-1")
 			t.Setenv("ATE_STORAGE_BACKEND", tc.backend)
 			t.Setenv("AWS_S3_USE_PATH_STYLE", tc.pathStyle)
+			t.Setenv("AZURE_STORAGE_ACCOUNT", tc.account)
 
 			got, err := NewFromEnv(context.Background())
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("NewFromEnv error = %v, want one mentioning %q", err, tc.wantErr)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("NewFromEnv: %v", err)
 			}
@@ -59,9 +72,16 @@ func TestNewFromEnv(t *testing.T) {
 				if got := c.client.Options().UsePathStyle; got != tc.wantPathStyle {
 					t.Errorf("UsePathStyle = %v, want %v", got, tc.wantPathStyle)
 				}
+			case *azureBlobClient:
+				if !tc.wantAzure {
+					t.Fatalf("NewFromEnv returned an Azure Blob client, want GCS")
+				}
+				if got, want := c.client.URL(), "https://substrate.blob.core.windows.net/"; got != want {
+					t.Errorf("client URL = %q, want %q", got, want)
+				}
 			case *gcsClient:
-				if tc.wantS3 {
-					t.Fatalf("NewFromEnv returned a GCS client, want S3")
+				if tc.wantS3 || tc.wantAzure {
+					t.Fatalf("NewFromEnv returned a GCS client, want %s", tc.backend)
 				}
 			default:
 				t.Fatalf("NewFromEnv returned %T", got)

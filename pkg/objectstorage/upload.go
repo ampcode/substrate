@@ -79,6 +79,9 @@ func uploadBufferMemory(client ObjectStorage) int64 {
 	case *s3Client:
 		// The SDK holds one producer buffer in addition to the active parts.
 		return (uploadConcurrency + 1) * uploadPartSize
+	case *azureBlobClient:
+		// UploadStream fills one block while uploadConcurrency are in flight.
+		return (uploadConcurrency + 1) * uploadPartSize
 	case *gcsClient:
 		// Composite uploads retain the lookahead, our part pool, and the SDK's
 		// copy of each part. Single uploads fit within this reservation too.
