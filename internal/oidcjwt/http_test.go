@@ -145,6 +145,51 @@ func TestK8sServiceAccountIssuerDiscoveryTransportSendsTokenToKubernetesJWKSURL(
 	}
 }
 
+func TestK8sServiceAccountIssuerDiscoveryTransportSendsTokenToConfiguredJWKSURI(t *testing.T) {
+	tokenFile := t.TempDir() + "/token"
+	if err := os.WriteFile(tokenFile, []byte("test-token\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	var gotAuth string
+	transport := &issuerDiscoveryTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotAuth = req.Header.Get("Authorization")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(nil),
+				Header:     make(http.Header),
+			}, nil
+		}),
+		tokenFile: tokenFile,
+		issuer:    "https://oidc.eks.us-east-1.amazonaws.com/id/ABCDEF",
+		jwksURI:   "https://jwks-mirror.ate-system.svc/keys",
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://jwks-mirror.ate-system.svc/keys", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if _, err := transport.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("Authorization = %q, want Bearer test-token", gotAuth)
+	}
+
+	gotAuth = ""
+	req, err = http.NewRequest(http.MethodGet, "https://jwks-mirror.ate-system.svc/other", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if _, err := transport.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization for a sibling path = %q, want empty", gotAuth)
+	}
+}
+
 func TestK8sServiceAccountIssuerDiscoveryTransportDoesNotSendTokenToArbitraryURL(t *testing.T) {
 	tokenFile := t.TempDir() + "/token"
 	if err := os.WriteFile(tokenFile, []byte("test-token\n"), 0o600); err != nil {
@@ -178,7 +223,7 @@ func TestK8sServiceAccountIssuerDiscoveryTransportDoesNotSendTokenToArbitraryURL
 }
 
 func TestBuildJWTIssuerDiscoveryClientUsesDefaultTransportWithoutDiscoveryToken(t *testing.T) {
-	client, err := NewHTTPClient("https://accounts.google.com", "", "")
+	client, err := NewHTTPClient("https://accounts.google.com", "", "", "")
 	if err != nil {
 		t.Fatalf("NewHTTPClient() error = %v", err)
 	}
@@ -191,7 +236,7 @@ func TestBuildJWTIssuerDiscoveryClientUsesDefaultTransportWithoutDiscoveryToken(
 }
 
 func TestNewHTTPClientRequiresCAWithDiscoveryToken(t *testing.T) {
-	if _, err := NewHTTPClient("https://kubernetes.default.svc", "", "/token"); err == nil {
+	if _, err := NewHTTPClient("https://kubernetes.default.svc", "", "", "/token"); err == nil {
 		t.Fatal("NewHTTPClient() with a discovery token and no CA succeeded")
 	}
 }
@@ -237,7 +282,7 @@ func TestNewHTTPClientTrustsRotatedCA(t *testing.T) {
 		}
 	}
 	writeCA(before.RootCA)
-	client, err := NewHTTPClient(ti.issuer(), caFile, "")
+	client, err := NewHTTPClient(ti.issuer(), "", caFile, "")
 	if err != nil {
 		t.Fatalf("NewHTTPClient() error = %v", err)
 	}

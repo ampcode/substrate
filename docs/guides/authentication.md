@@ -365,6 +365,26 @@ jwtProviders:
   `ate-api-server`'s own ServiceAccount token, so set it only for the
   Substrate cluster's own issuer. `ate-api-server` re-reads both files when
   they change.
+- `jwksURI` is optional. When set, `ate-api-server` skips OIDC discovery and
+  fetches the issuer's signing keys from that HTTPS URL; tokens must still
+  carry `issuer` as their `iss` claim. Use it when the cluster's service
+  account issuer is an external URL that `ate-api-server` cannot reach (EKS,
+  AKS and GKE clusters without egress): every Kubernetes API server serves its
+  own keys at `/openid/v1/jwks`, so the following verifies service account
+  tokens with no traffic leaving the cluster. `discoveryTokenFile` is also sent
+  to `jwksURI`. Find the issuer with
+  `kubectl get --raw /.well-known/openid-configuration`.
+
+  ```yaml
+  jwtProviders:
+  - name: kubernetes
+    issuer: https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE
+    audiences:
+    - api.ate-system.svc
+    jwksURI: https://kubernetes.default.svc/openid/v1/jwks
+    certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+  ```
 - The Google values are what the Google Cloud CLI issues today: issuer
   `https://accounts.google.com`, and the Cloud SDK's shared client ID as the
   audience. They are examples, not built-in defaults; check the claims your
