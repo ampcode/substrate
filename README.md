@@ -98,6 +98,50 @@ if you don't have access.
 - [#substrate-users](https://cloud-native.slack.com/archives/C0B6RCAJULW) to discuss using substrate.
 - [#substrate-dev](https://cloud-native.slack.com/archives/C0B6M3E2J3D) to discuss developing substrate.
 
+## This fork (ampcode/substrate)
+
+This repository is Amp's fork of
+[agent-substrate/substrate](https://github.com/agent-substrate/substrate). It
+tracks upstream `main` and carries a short series of commits on top, each of
+which says in its message what it changes and why upstream does not cover it.
+Rebase the series onto upstream rather than merging, and drop a commit once
+upstream ships its equivalent. The series is:
+
+- `ateworker-gvisor`: sandboxes run with `--allow-suid` and `--net-raw`
+  (`cmd/ateworker-gvisor/kodata/internal_flags.json`).
+- `ateapi`: `jwksURI` on JWT providers in the authentication config
+  (`cmd/ateapi/internal/apiauthn`, `internal/oidcjwt`), so tokens verify
+  without egress to the issuer.
+- `atelet`: image pulls authenticate with the Docker config file
+  (`--docker-config-auth-for-image-pulls`) before the node's kubelet
+  credential providers.
+- `objectstore-plugin`: the Azure Blob Storage backend (`ATE_STORAGE_BACKEND=azblob`,
+  `az://` snapshot locations) in `pkg/objectstorage` and `internal/objectstore`.
+- `ateworker-gvisor`: on `SIGTERM` the worker asks the control plane to
+  suspend every actor it hosts (10 minute grace) before stopping them.
+- Agent-based PKI (`cmd/podcert-agent`, the podcertificate-controller's
+  issuer API and trust-bundle publisher,
+  `manifests/ate-install/components/agent-pki`) for clusters that do not
+  serve `certificates.k8s.io/v1beta1` PodCertificateRequests or
+  ClusterTrustBundles, such as AKS and EKS 1.34 to 1.36.
+- `ate-setup bootstrap`, the Helm pre-install hook that creates the namespace,
+  CA pools and apiconfig ConfigMap without a repository checkout.
+- `manifests/ate-install/aks` and `eks`: kustomize overlays for AKS (Azure
+  Blob, Workload Identity, ACR credential provider) and EKS (S3, IRSA, ECR
+  credential provider).
+- `manifests/ate-install/atenet-egress.yaml`: explicit circuit breakers on
+  the egress gateway's forwarding clusters.
+- `ateapi`: `CreateTag` also accepts a `RUNNING` source actor and tags the
+  snapshot its last suspend uploaded, so a live sandbox can be snapshotted
+  with `SuspendActor(ASYNCHRONOUS)` → `ResumeActor` → `CreateTag` once the
+  upload completes, instead of staying frozen through the upload and copy.
+
+Dropped from earlier versions of this series because upstream now ships the
+equivalent: `RLIMIT_NOFILE` raising, ECR image-pull auth (kubelet credential
+providers), `skip_golden_snapshot` (`golden_snapshot_config.mode`), router log
+level, and gVisor `SNAPSHOT_FIDELITY_ROOTFS` (upstream's rootfs/ + fs/
+fscheckpoint bundles on runsc v4).
+
 ## Developing
 
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to
