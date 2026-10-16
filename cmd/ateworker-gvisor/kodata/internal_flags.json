@@ -9,17 +9,22 @@
   "commands": {
     "create": {
       "globalFlags": [
-        "--cpu-num-from-quota"
+        "--cpu-num-from-quota",
+        "--allow-suid",
+        "--net-raw"
       ]
     },
     "start": {
       "globalFlags": [
-        "-allow-connected-on-save"
+        "-allow-connected-on-save",
+        "--net-raw"
       ]
     },
     "restore": {
       "globalFlags": [
-        "--cpu-num-from-quota"
+        "--cpu-num-from-quota",
+        "--allow-suid",
+        "--net-raw"
       ],
       "subcommandFlags": [
         "-background",
