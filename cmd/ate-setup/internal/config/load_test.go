@@ -217,3 +217,30 @@ func errPath(err error) string {
 	}
 	return rest
 }
+
+// bootstrap runs in a hook pod with no checkout: NoRepo must load the same
+// settings from the environment without looking for go.mod or
+// .ate-dev-env.sh.
+func TestLoadFlagsNoRepoNeedsNoCheckout(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ATE_API_LOG_LEVEL", "debug")
+	t.Chdir(t.TempDir())
+
+	fs, err := optionsFlagSet(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFlags(fs, LoadOptions{NoDevEnv: true}); err == nil || !strings.Contains(err.Error(), "go.mod") {
+		t.Fatalf("LoadFlags() outside a checkout error = %v, want a go.mod error", err)
+	}
+	cfg, err := LoadFlags(fs, LoadOptions{NoRepo: true})
+	if err != nil {
+		t.Fatalf("LoadFlags(NoRepo) error = %v", err)
+	}
+	if cfg.Root != "" {
+		t.Errorf("Root = %q, want empty", cfg.Root)
+	}
+	if cfg.APILogLevel != "debug" {
+		t.Errorf("APILogLevel = %q, want debug from the environment", cfg.APILogLevel)
+	}
+}
