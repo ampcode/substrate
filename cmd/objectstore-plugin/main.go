@@ -15,8 +15,8 @@
 // Command objectstore-plugin serves the object-store plugin API on GCS or S3 over
 // a Unix socket. It runs as a sidecar: "node" next to atelet, serving snapshot
 // transfers and sandbox assets, and "control" next to ate-api-server. The
-// backend is chosen by ATE_STORAGE_BACKEND ("s3", or GCS by default) with the
-// ambient credentials.
+// backend is chosen by ATE_STORAGE_BACKEND ("s3", "azblob", or GCS by default)
+// with the ambient credentials.
 // "healthcheck" reports whether a running plugin is serving, for the sidecar's
 // startup probe.
 package main
@@ -165,6 +165,13 @@ func newObjectStore(ctx context.Context) (objectstore.Store, error) {
 		}
 		return objectstore.NewS3(client), nil
 	}
+	if objectstorage.UsesAzureBlob() {
+		client, err := objectstorage.NewAzureBlobClientFromEnv(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return objectstore.NewAzureBlob(client), nil
+	}
 	// GCS is currently the default, TODO: we assume workload identity / ADC
 	client, err := storage.NewClient(ctx)
 	if err != nil {
@@ -178,6 +185,9 @@ func newObjectStore(ctx context.Context) (objectstore.Store, error) {
 func assetScheme() string {
 	if objectstorage.UsesS3() {
 		return "s3"
+	}
+	if objectstorage.UsesAzureBlob() {
+		return "az"
 	}
 	return "gs"
 }

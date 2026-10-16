@@ -28,8 +28,8 @@ import (
 )
 
 // AssetPlugin serves AssetProvider on an object storage client. It reads
-// URIs of its backend's scheme (gs:// on GCS, s3:// on S3) as
-// <bucket>/<object>, and returns InvalidArgument for any other scheme without
+// URIs of its backend's scheme (gs:// on GCS, s3:// on S3, az:// on Azure
+// Blob) as <bucket>/<object>, and returns InvalidArgument for any other scheme without
 // reading anything: a gs:// bucket name read on S3 names someone else's
 // bucket, or none. atelet then reads a gs:// asset anonymously.
 //
@@ -45,13 +45,13 @@ type AssetPlugin struct {
 	stager *assetfetch.Stager
 }
 
-// NewAssetPlugin returns an AssetPlugin that serves URIs of scheme ("gs" or
-// "s3", client's backend) from client, writes caller files only below root and
+// NewAssetPlugin returns an AssetPlugin that serves URIs of scheme ("gs",
+// "s3" or "az", client's backend) from client, writes caller files only below root and
 // stages downloads in stagingDir, which must not be below root, holding at
 // most stagingCapacity bytes there at once.
 func NewAssetPlugin(client objectstorage.ObjectStorage, scheme, root, stagingDir string, stagingCapacity int64) (*AssetPlugin, error) {
-	if scheme != "gs" && scheme != "s3" {
-		return nil, fmt.Errorf("asset URI scheme %q is not gs or s3", scheme)
+	if scheme != "gs" && scheme != "s3" && scheme != "az" {
+		return nil, fmt.Errorf("asset URI scheme %q is not gs, s3 or az", scheme)
 	}
 	stager, err := assetfetch.NewStager(root, stagingDir, stagingCapacity)
 	if err != nil {
