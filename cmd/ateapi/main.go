@@ -658,11 +658,15 @@ func buildServerTLSConfig(ctx context.Context, credBundlePath, caCertsPath strin
 func buildJWTProviders(ctx context.Context, cfg *apiauthn.AuthenticationConfig) (apiauthn.ServerConfig, error) {
 	var serverCfg apiauthn.ServerConfig
 	for _, providerCfg := range cfg.JWTProviders {
-		httpClient, err := oidcjwt.NewHTTPClient(providerCfg.Issuer, providerCfg.CertificateAuthorityFile, providerCfg.DiscoveryTokenFile)
+		httpClient, err := oidcjwt.NewHTTPClient(providerCfg.Issuer, providerCfg.JWKSURI, providerCfg.CertificateAuthorityFile, providerCfg.DiscoveryTokenFile)
 		if err != nil {
 			return apiauthn.ServerConfig{}, fmt.Errorf("initialize JWT provider %q: %w", providerCfg.Name, err)
 		}
-		verifier := oidcjwt.NewVerifier(providerCfg.Issuer, providerCfg.Audiences, oidcjwt.HTTPKeySource(providerCfg.Issuer, httpClient))
+		keys := oidcjwt.HTTPKeySource(providerCfg.Issuer, httpClient)
+		if providerCfg.JWKSURI != "" {
+			keys = oidcjwt.JWKSURIKeySource(providerCfg.Issuer, providerCfg.JWKSURI, httpClient)
+		}
+		verifier := oidcjwt.NewVerifier(providerCfg.Issuer, providerCfg.Audiences, keys)
 		serverCfg.JWTProviders = append(serverCfg.JWTProviders, apiauthn.JWTProvider{
 			Name:   providerCfg.Name,
 			Issuer: providerCfg.Issuer,
