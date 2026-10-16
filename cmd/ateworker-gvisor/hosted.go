@@ -168,6 +168,20 @@ func (s *AteWorkerService) hostedSessions() []*workloadSession {
 	return out
 }
 
+// runningActors returns the actors whose containers exist, the ones shutdown
+// asks the control plane to suspend.
+func (s *AteWorkerService) runningActors() []*hostedActor {
+	s.actorsMu.RLock()
+	defer s.actorsMu.RUnlock()
+	var out []*hostedActor
+	for _, hosted := range s.actors {
+		if hosted.session != nil {
+			out = append(out, hosted)
+		}
+	}
+	return out
+}
+
 // setSession records the runsc state for an actor once its containers exist.
 func (s *AteWorkerService) setSession(actorUID string, session *workloadSession) {
 	s.actorsMu.Lock()
