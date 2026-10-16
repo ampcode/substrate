@@ -28,11 +28,16 @@ import (
 
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
 	"go.ate.dev/substrate/cmd/atelet/internal/trustbundle"
+	"go.ate.dev/substrate/internal/egressmitmtrust"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/volumepath"
+	certsv1 "k8s.io/api/certificates/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -294,9 +299,12 @@ func (r *systemInfoVolumeRefresher) eventHandler() cache.ResourceEventHandler {
 			return
 		}
 
-		// Map clustertrustbundles to the particular Substrate trust bundle names they back.
+		// Map the backing objects (a ClusterTrustBundle, or the ConfigMap
+		// atecontroller maintains under agent PKI delivery) to the particular
+		// Substrate trust bundle names they back. Both informers are filtered
+		// to the one object, so the name alone identifies the bundle.
 		switch ctb.GetName() {
-		case trustbundle.EgressCTB:
+		case trustbundle.EgressCTB, egressmitmtrust.ConfigMapName:
 			r.queue.Add(trustbundle.EgressName)
 		}
 	}
@@ -304,6 +312,30 @@ func (r *systemInfoVolumeRefresher) eventHandler() cache.ResourceEventHandler {
 		AddFunc:    enqueue,
 		UpdateFunc: func(_, obj any) { enqueue(obj) },
 		DeleteFunc: enqueue,
+	}
+}
+
+// configMapTrustBundleGetter adapts the ConfigMap atecontroller maintains in
+// agent PKI delivery (clusters without certificates.k8s.io ClusterTrustBundles)
+// to the ClusterTrustBundle getter trustbundle.Source reads from. The returned
+// bundle carries only the PEM; callers read nothing else.
+func configMapTrustBundleGetter(lister corelisters.ConfigMapNamespaceLister) func(name string) (*certsv1.ClusterTrustBundle, error) {
+	return func(name string) (*certsv1.ClusterTrustBundle, error) {
+		if name != egressmitmtrust.ClusterTrustBundleName {
+			return nil, apierrors.NewNotFound(certsv1.Resource("clustertrustbundles"), name)
+		}
+		cm, err := lister.Get(egressmitmtrust.ConfigMapName)
+		if err != nil {
+			return nil, err
+		}
+		raw, ok := cm.Data[egressmitmtrust.ConfigMapKey]
+		if !ok {
+			return nil, fmt.Errorf("ConfigMap %s/%s has no %q key", egressmitmtrust.Namespace, egressmitmtrust.ConfigMapName, egressmitmtrust.ConfigMapKey)
+		}
+		return &certsv1.ClusterTrustBundle{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       certsv1.ClusterTrustBundleSpec{TrustBundle: raw},
+		}, nil
 	}
 }
 

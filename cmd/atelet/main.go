@@ -45,6 +45,7 @@ import (
 	"go.ate.dev/substrate/internal/atelet"
 	"go.ate.dev/substrate/internal/clustertrustbundle"
 	"go.ate.dev/substrate/internal/credbundle"
+	"go.ate.dev/substrate/internal/egressmitmtrust"
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/ocispec"
@@ -78,6 +79,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
+	certsv1 "k8s.io/api/certificates/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	kubeinformers "k8s.io/client-go/informers"
@@ -97,7 +99,10 @@ var (
 	clientCACerts        = pflag.String("client-ca-certs", "/run/podidentity.podcert.ate.dev/trust-bundle.pem", "CA bundle used to verify gRPC client certificates.")
 	ateapiAddress        = pflag.String("ateapi-address", "k8s:///api.ate-system.svc:443", "ateapi gRPC target used by the credential broker.")
 	ateapiCAFile         = pflag.String("ateapi-ca-file", "/run/servicedns.podcert.ate.dev/trust-bundle.pem", "CA bundle used to verify ateapi.")
-	ateapiServerName     = pflag.String("ateapi-server-name", "api.ate-system.svc", "DNS name expected on the ateapi certificate.")
+
+	egressMITMTrustSource = pflag.String("egress-mitm-trust-source", "clustertrustbundle",
+		"Where the egress MITM trust bundle is read from: clustertrustbundle (certificates.k8s.io/v1beta1) or configmap ("+egressmitmtrust.Namespace+"/"+egressmitmtrust.ConfigMapName+", for clusters without that API).")
+	ateapiServerName = pflag.String("ateapi-server-name", "api.ate-system.svc", "DNS name expected on the ateapi certificate.")
 
 	// The kubelet already knows how to authenticate to its node's cloud
 	// registry, via an exec plugin the node ships. Pointing atelet at the same
@@ -297,11 +302,34 @@ func main() {
 
 	csiDriverConfigGetter := &directCSIDriverConfigGetter{client: ateClient}
 
-	trustBundles, err := clustertrustbundle.NewClient(k8sClient, func(o *metav1.ListOptions) {
-		o.FieldSelector = fields.OneTermEqualSelector("metadata.name", trustbundle.EgressCTB).String()
-	})
-	if err != nil {
-		slog.ErrorContext(ctx, "Error discovering ClusterTrustBundle API", slog.Any("err", err))
+	// The egress MITM trust bundle (currently the only cluster-sourced trust
+	// bundle) is read from whichever object this cluster delivers PKI with: a
+	// ClusterTrustBundle where certificates.k8s.io serves them, otherwise the
+	// ConfigMap atecontroller maintains in ate-system (agent PKI delivery).
+	var egressTrustGetter func(name string) (*certsv1.ClusterTrustBundle, error)
+	var egressTrustInformer cache.SharedIndexInformer
+	switch *egressMITMTrustSource {
+	case "clustertrustbundle":
+		trustBundles, err := clustertrustbundle.NewClient(k8sClient, func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", trustbundle.EgressCTB).String()
+		})
+		if err != nil {
+			slog.ErrorContext(ctx, "Error discovering ClusterTrustBundle API", slog.Any("err", err))
+			os.Exit(1)
+		}
+		egressTrustGetter = trustBundles.GetCached
+		egressTrustInformer = trustBundles.Informer()
+	case "configmap":
+		configMapFactory := kubeinformers.NewSharedInformerFactoryWithOptions(k8sClient, 24*time.Hour,
+			kubeinformers.WithNamespace(egressmitmtrust.Namespace),
+			kubeinformers.WithTweakListOptions(func(o *metav1.ListOptions) {
+				o.FieldSelector = fields.OneTermEqualSelector("metadata.name", egressmitmtrust.ConfigMapName).String()
+			}))
+		configMaps := configMapFactory.Core().V1().ConfigMaps()
+		egressTrustGetter = configMapTrustBundleGetter(configMaps.Lister().ConfigMaps(egressmitmtrust.Namespace))
+		egressTrustInformer = configMaps.Informer()
+	default:
+		slog.ErrorContext(ctx, "Invalid --egress-mitm-trust-source; want clustertrustbundle or configmap", slog.String("value", *egressMITMTrustSource))
 		os.Exit(1)
 	}
 
@@ -311,14 +339,14 @@ func main() {
 		serverboot.Fatal(ctx, "Error reading system root certificates", err)
 	}
 
-	trustBundleSource := trustbundle.NewSource(trustBundles.GetCached, systemRootsPEM)
+	trustBundleSource := trustbundle.NewSource(egressTrustGetter, systemRootsPEM)
 
-	systemInfoVolumes := newSystemInfoVolumeRefresher(trustBundleSource, trustBundles.Informer())
+	systemInfoVolumes := newSystemInfoVolumeRefresher(trustBundleSource, egressTrustInformer)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
-	go trustBundles.Informer().Run(stopCh)
-	cache.WaitForCacheSync(stopCh, trustBundles.Informer().HasSynced)
+	go egressTrustInformer.Run(stopCh)
+	cache.WaitForCacheSync(stopCh, egressTrustInformer.HasSynced)
 
 	objectStorePluginConn, err := pluginsocket.Dial(*objectStorePluginSocket, pluginsocket.ReadyWait)
 	if err != nil {
