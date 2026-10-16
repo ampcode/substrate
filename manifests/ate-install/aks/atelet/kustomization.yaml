@@ -1,0 +1,76 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# atelet for Azure AKS.
+#
+# Image pulls: the base mounts the node's kubelet credential provider config
+# and bin dir from GKE's paths. AKS nodes (AgentBaker, Ubuntu and Azure Linux)
+# write the kubelet.config.k8s.io/v1 CredentialProviderConfig to
+# /var/lib/kubelet/credential-provider-config.yaml and install
+# acr-credential-provider in /var/lib/kubelet/credential-provider, so the two
+# hostPaths are repointed there; atelet then pulls from ACR with the node's
+# identity, like the kubelet. The args keep the base's flags. Beware the
+# FileOrCreate type the base uses: on a node that has no config file atelet
+# refuses to start on an empty one, so the paths must be right for the node
+# image in use.
+#
+# Snapshots: the objectstore-plugin sidecar holds the object storage settings
+# (atelet itself has none and exits if ATE_STORAGE_BACKEND is set on it). It
+# runs with the Azure Blob backend; the storage account comes from the
+# ate-azure-config ConfigMap (key storageAccount), which the installer
+# creates; the credentials come from Workload Identity: the installer
+# annotates the atelet ServiceAccount with azure.workload.identity/client-id,
+# and the pod label below makes the AKS webhook project a federated token and
+# set AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE on every
+# atelet pod, which the SDK's default credential chain in pkg/objectstorage
+# uses. Nothing here names the subscription, identity or account.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../atelet.yaml
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          metadata:
+            labels:
+              azure.workload.identity/use: "true"
+          spec:
+            initContainers:
+            - name: objectstore-plugin
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: azblob
+              - name: AZURE_STORAGE_ACCOUNT
+                valueFrom:
+                  configMapKeyRef:
+                    name: ate-azure-config
+                    key: storageAccount
+            volumes:
+            - name: image-credential-provider-bin
+              hostPath:
+                path: /var/lib/kubelet/credential-provider
+                type: DirectoryOrCreate
+            - name: image-credential-provider-config
+              hostPath:
+                path: /var/lib/kubelet/credential-provider-config.yaml
+                type: FileOrCreate

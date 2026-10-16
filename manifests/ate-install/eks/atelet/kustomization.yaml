@@ -1,0 +1,86 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# atelet for Amazon EKS.
+#
+# Image pulls: atelet pulls actor and volume images itself, and private ECR
+# has no anonymous pull. The base mounts the node's kubelet credential
+# provider config and bin dir from GKE's paths; EKS AMIs (Amazon Linux 2023
+# and AL2) ship the kubelet.config.k8s.io/v1 CredentialProviderConfig as
+# /etc/eks/image-credential-provider/config.json (JSON parses as YAML) and
+# ecr-credential-provider in /etc/eks/image-credential-provider, so the two
+# hostPaths are repointed there; atelet then pulls from ECR with the node
+# role, like the kubelet. The args keep the base's flags. Beware the
+# FileOrCreate type the base uses: on a node that has no config file atelet
+# refuses to start on an empty one, so the paths must be right for the AMI in
+# use.
+#
+# Snapshots: the objectstore-plugin sidecar holds the object storage settings
+# (atelet itself has none and exits if ATE_STORAGE_BACKEND is set on it). It
+# runs with the S3 backend pointed at Amazon S3 itself. The bucket's region
+# comes from the ate-aws-config ConfigMap (key region), which the installer
+# creates; the credentials come from IRSA: the installer annotates the atelet
+# ServiceAccount with eks.amazonaws.com/role-arn, and EKS's pod identity
+# webhook then projects a web identity token and sets AWS_ROLE_ARN and
+# AWS_WEB_IDENTITY_TOKEN_FILE on every atelet pod, which the SDK's default
+# credential chain in pkg/objectstorage uses. Nothing here names the account
+# or role.
+#
+# atelet runs only on worker nodes (those labelled ate.dev/sandboxClass).
+# Actors are placed on ateworker pods, which the WorkerPool schedules there,
+# so atelet has nothing to do elsewhere; and on EKS Auto Mode's Bottlerocket
+# nodes its hostPath and device-plugin setup would not work anyway.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../atelet.yaml
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: atelet
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: ate.dev/sandboxClass
+                      operator: Exists
+            initContainers:
+            - name: objectstore-plugin
+              env:
+              - name: ATE_STORAGE_BACKEND
+                value: s3
+              - name: AWS_REGION
+                valueFrom:
+                  configMapKeyRef:
+                    name: ate-aws-config
+                    key: region
+            volumes:
+            - name: image-credential-provider-bin
+              hostPath:
+                path: /etc/eks/image-credential-provider
+                type: DirectoryOrCreate
+            - name: image-credential-provider-config
+              hostPath:
+                path: /etc/eks/image-credential-provider/config.json
+                type: FileOrCreate
