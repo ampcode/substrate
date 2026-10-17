@@ -28,7 +28,7 @@ import (
 	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
 )
 
-var helmRelease, helmReleaseNamespace, crdsPath string
+var helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath string
 
 // bootstrapCmd is the part of "deploy ate-system" that manifests cannot carry:
 // the generated key material and the config derived from the cluster. It runs
@@ -46,7 +46,9 @@ in-cluster before the static manifests are applied; with --helm-release the
 namespaces carry Helm's ownership metadata so a chart that also lists them can
 adopt them. With --crds the CRDs in that directory are applied too, which is
 how a chart upgrades them: Helm installs a chart's CRDs once and never changes
-them.`,
+them. --admission-policies applies the manifests in that directory right after
+the CRDs, so the resources applied next are checked by the current policies and
+not by the previous release's.`,
 	Args: cobra.NoArgs,
 	// Replaces the root hook: that one needs a repository checkout for
 	// .ate-dev-env.sh and the manifests, and fetches GKE credentials, none of
@@ -79,6 +81,15 @@ them.`,
 		// to the old one.
 		if crdsPath != "" {
 			if err := env.ApplyCRDs(ctx, crdsPath); err != nil {
+				return err
+			}
+		}
+		// Helm applies a release's resources sorted by kind, custom resources
+		// before ValidatingAdmissionPolicy, so a SandboxConfig in the new
+		// shape would otherwise be checked by the policy of the old release.
+		if admissionPoliciesPath != "" {
+			log.Step("apply_admission_policies")
+			if err := env.Kube.ApplyPath(ctx, admissionPoliciesPath); err != nil {
 				return err
 			}
 		}
@@ -115,4 +126,5 @@ func init() {
 	f.StringVar(&helmRelease, "helm-release", "", "Helm release name to mark the namespaces as owned by")
 	f.StringVar(&helmReleaseNamespace, "helm-release-namespace", "", "Namespace of that Helm release")
 	f.StringVar(&crdsPath, "crds", "", "Directory of CRD manifests to apply before anything else (none by default)")
+	f.StringVar(&admissionPoliciesPath, "admission-policies", "", "Directory of admission policy manifests to apply after the CRDs (none by default)")
 }
