@@ -38,9 +38,9 @@ var helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath string
 var bootstrapCmd = &cobra.Command{
 	Use:   "bootstrap",
 	Short: "Create the generated secrets and config for ate-system from inside the cluster",
-	Long: `Create the namespaces, the actor-identity and podcertificate signing pools, and
-the ate-api-server config that "deploy ate-system" generates, without the rest of
-the install. Existing pools are kept; the PostgreSQL connection settings are
+	Long: `Create the namespaces, the actor-identity, podcertificate and egress MITM
+signing pools, and the ate-api-server config that "deploy ate-system" generates,
+without the rest of the install. Existing pools are kept; the PostgreSQL connection settings are
 rewritten from the configuration every time, as on deploy. Meant to run
 in-cluster before the static manifests are applied; with --helm-release the
 namespaces carry Helm's ownership metadata so a chart that also lists them can
@@ -96,6 +96,11 @@ not by the previous release's.`,
 		// The podcertificate controller mounts every signer pool, so the
 		// pools have to exist before its Deployment is applied.
 		if err := env.EnsurePodCertificateCAs(ctx); err != nil {
+			return err
+		}
+		// atenet-egress mounts this pool; "deploy ate-system" creates it
+		// right before applying the egress manifests.
+		if err := env.EnsureEgressMITMCAPoolSecret(ctx); err != nil {
 			return err
 		}
 		return env.EnsureAPIServerPrerequisites(ctx)
