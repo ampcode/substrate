@@ -128,6 +128,8 @@ upstream ships its equivalent. The series is:
   the namespaces, CA pools and apiconfig ConfigMap without a repository
   checkout, and with `--crds` applies the chart's CRDs so an upgrade carries
   schema changes (Helm installs a chart's CRDs once and never upgrades them).
+  `--admission-policies` applies the SandboxConfig admission policy right
+  after, before Helm patches the SandboxConfig the policy checks.
 - `manifests/ate-install/aks` and `eks`: kustomize overlays for AKS (Azure
   Blob, Workload Identity, ACR credential provider) and EKS (S3, IRSA, ECR
   credential provider).
