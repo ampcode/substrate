@@ -28,7 +28,7 @@ import (
 	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
 )
 
-var helmRelease, helmReleaseNamespace string
+var helmRelease, helmReleaseNamespace, crdsPath string
 
 // bootstrapCmd is the part of "deploy ate-system" that manifests cannot carry:
 // the generated key material and the config derived from the cluster. It runs
@@ -44,7 +44,9 @@ the install. Existing pools are kept; the PostgreSQL connection settings are
 rewritten from the configuration every time, as on deploy. Meant to run
 in-cluster before the static manifests are applied; with --helm-release the
 namespaces carry Helm's ownership metadata so a chart that also lists them can
-adopt them.`,
+adopt them. With --crds the CRDs in that directory are applied too, which is
+how a chart upgrades them: Helm installs a chart's CRDs once and never changes
+them.`,
 	Args: cobra.NoArgs,
 	// Replaces the root hook: that one needs a repository checkout for
 	// .ate-dev-env.sh and the manifests, and fetches GKE credentials, none of
@@ -69,6 +71,14 @@ adopt them.`,
 		ctx := cmd.Context()
 		for _, name := range []string{steps.NamespaceAteSystem, steps.NamespacePodCert, "otel-system"} {
 			if err := applyNamespace(ctx, name); err != nil {
+				return err
+			}
+		}
+		// Before the controllers that serve the new schema roll, so a
+		// WorkerPool or SandboxConfig the chart applies next is not pruned
+		// to the old one.
+		if crdsPath != "" {
+			if err := env.ApplyCRDs(ctx, crdsPath); err != nil {
 				return err
 			}
 		}
@@ -104,4 +114,5 @@ func init() {
 	f := bootstrapCmd.Flags()
 	f.StringVar(&helmRelease, "helm-release", "", "Helm release name to mark the namespaces as owned by")
 	f.StringVar(&helmReleaseNamespace, "helm-release-namespace", "", "Namespace of that Helm release")
+	f.StringVar(&crdsPath, "crds", "", "Directory of CRD manifests to apply before anything else (none by default)")
 }
