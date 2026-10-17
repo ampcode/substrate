@@ -124,8 +124,10 @@ upstream ships its equivalent. The series is:
   `manifests/ate-install/components/agent-pki`) for clusters that do not
   serve `certificates.k8s.io/v1beta1` PodCertificateRequests or
   ClusterTrustBundles, such as AKS and EKS 1.34 to 1.36.
-- `ate-setup bootstrap`, the Helm pre-install hook that creates the namespace,
-  CA pools and apiconfig ConfigMap without a repository checkout.
+- `ate-setup bootstrap`, the Helm pre-install and pre-upgrade hook that creates
+  the namespaces, CA pools and apiconfig ConfigMap without a repository
+  checkout, and with `--crds` applies the chart's CRDs so an upgrade carries
+  schema changes (Helm installs a chart's CRDs once and never upgrades them).
 - `manifests/ate-install/aks` and `eks`: kustomize overlays for AKS (Azure
   Blob, Workload Identity, ACR credential provider) and EKS (S3, IRSA, ECR
   credential provider).

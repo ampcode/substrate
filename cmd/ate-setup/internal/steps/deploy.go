@@ -598,9 +598,33 @@ func (e *Env) EnsureCRDs(ctx context.Context) error {
 	return e.waitCRDsEstablished(ctx, missing)
 }
 
+// ApplyCRDs applies every CRD under path, new or changed, and waits for them
+// to be served. For an in-cluster upgrade (the Helm chart's pre-upgrade hook)
+// where the manifests are mounted rather than checked out: Helm installs a
+// chart's CRDs once and never upgrades them.
+func (e *Env) ApplyCRDs(ctx context.Context, path string) error {
+	log.Step("apply_crds")
+	crds, err := loadCRDs(path)
+	if err != nil {
+		return err
+	}
+	if len(crds) == 0 {
+		return fmt.Errorf("no CRDs under %s", path)
+	}
+	if err := e.Kube.Apply(ctx, crds); err != nil {
+		return err
+	}
+	return e.waitCRDsEstablished(ctx, crds)
+}
+
 // generatedCRDs loads the generated CRDs, leaving out the RBAC beside them.
 func (e *Env) generatedCRDs() ([]*unstructured.Unstructured, error) {
-	objs, err := kube.LoadPath(e.Cfg.Manifest("generated"))
+	return loadCRDs(e.Cfg.Manifest("generated"))
+}
+
+// loadCRDs loads the CRDs under path, leaving out anything else beside them.
+func loadCRDs(path string) ([]*unstructured.Unstructured, error) {
+	objs, err := kube.LoadPath(path)
 	if err != nil {
 		return nil, err
 	}
