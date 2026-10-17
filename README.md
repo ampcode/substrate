@@ -125,8 +125,8 @@ upstream ships its equivalent. The series is:
   serve `certificates.k8s.io/v1beta1` PodCertificateRequests or
   ClusterTrustBundles, such as AKS and EKS 1.34 to 1.36.
 - `ate-setup bootstrap`, the Helm pre-install and pre-upgrade hook that creates
-  the namespaces, CA pools and apiconfig ConfigMap without a repository
-  checkout, and with `--crds` applies the chart's CRDs so an upgrade carries
+  the namespaces, the CA pools (podcertificate signers, actor identity and the
+  egress MITM pool) and the apiconfig ConfigMap without a repository checkout, and with `--crds` applies the chart's CRDs so an upgrade carries
   schema changes (Helm installs a chart's CRDs once and never upgrades them).
   `--admission-policies` applies the SandboxConfig admission policy right
   after, before Helm patches the SandboxConfig the policy checks.
