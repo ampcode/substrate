@@ -122,9 +122,9 @@ type ControlClient interface {
 	// * Called by the egress gateway when actor client certificate injection is
 	//   configured for outbound requests.
 	MintActorCertificate(ctx context.Context, in *MintActorCertificateRequest, opts ...grpc.CallOption) (*MintActorCertificateResponse, error)
-	// Tag the external snapshot a suspended Actor holds. The tag gets its own
-	// copy of that snapshot, so suspending or deleting the Actor afterwards
-	// cannot collect it.
+	// Tag the external snapshot a suspended Actor holds, or the one a running
+	// Actor's last suspend uploaded. The tag gets its own copy of that snapshot,
+	// so suspending or deleting the Actor afterwards cannot collect it.
 	CreateTag(ctx context.Context, in *CreateTagRequest, opts ...grpc.CallOption) (*Tag, error)
 	// Get a Tag.
 	GetTag(ctx context.Context, in *GetTagRequest, opts ...grpc.CallOption) (*Tag, error)
@@ -686,9 +686,9 @@ type ControlServer interface {
 	// * Called by the egress gateway when actor client certificate injection is
 	//   configured for outbound requests.
 	MintActorCertificate(context.Context, *MintActorCertificateRequest) (*MintActorCertificateResponse, error)
-	// Tag the external snapshot a suspended Actor holds. The tag gets its own
-	// copy of that snapshot, so suspending or deleting the Actor afterwards
-	// cannot collect it.
+	// Tag the external snapshot a suspended Actor holds, or the one a running
+	// Actor's last suspend uploaded. The tag gets its own copy of that snapshot,
+	// so suspending or deleting the Actor afterwards cannot collect it.
 	CreateTag(context.Context, *CreateTagRequest) (*Tag, error)
 	// Get a Tag.
 	GetTag(context.Context, *GetTagRequest) (*Tag, error)
