@@ -186,8 +186,96 @@ func TestTagActorSnapshot_LocationOutsideSegmentRules(t *testing.T) {
 	}
 }
 
+// TestTagActorSnapshot_RunningActor verifies that a running actor can be
+// tagged with the snapshot its last suspend took, the state a resume leaves
+// recorded: an uploaded one is copied as it is, and one still node-local is
+// uploaded by the atelet on its node first, like a suspended actor's.
+func TestTagActorSnapshot_RunningActor(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, atelet, objects := newWireFinalizeWorkflow(t, persistence)
+	tmplUID := template.GetMetadata().GetUid()
+
+	actor, actorSnapshot := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "rootfs.zst")
+	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapi.ActorStatus) {
+		s.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+		s.AssignedNode = "node-1"
+		s.WorkerAssignment = &ateapi.WorkerAssignment{NodeName: "node-1", WorkerPod: "worker-1"}
+	})
+	actorRef := resources.ActorRefFromActor(actor)
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+	if got := atelet.promoteRequest(); got != nil {
+		t.Errorf("PromoteSnapshot request = %v, want none: the snapshot is uploaded already", got)
+	}
+	tagSnapshot := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+	if tagSnapshot == "" || tagSnapshot == actorSnapshot.String() {
+		t.Fatalf("tag snapshot uri = %q, want a copy of its own rather than the actor's %q", tagSnapshot, actorSnapshot)
+	}
+	wantObjects := []string{"manifest.json", "rootfs.zst"}
+	if diff := cmp.Diff(wantObjects, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+		t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+	// The running actor is left as it was: still running, its snapshot intact.
+	got, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if diff := cmp.Diff(actor.GetStatus(), got.GetStatus(), protocmp.Transform()); diff != "" {
+		t.Errorf("actor status changed by the tag (-want +got):\n%s", diff)
+	}
+
+	// A pause and resume after that leave a newer node-local snapshot above
+	// the uploaded one, with its upload still pending. The tag has the atelet
+	// on its node upload it, records the upload, and copies that snapshot.
+	pausedURI := mustActorSnapshotURI(t, template, actor, "paused")
+	objects.PutSnapshot(t, pausedURI, "manifest.json", "memory.zst")
+	paused := newDurableSnapshot(2, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, pausedURI.Name(), pausedURI.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING)
+	paused.Locality = "node-1"
+	mustUpdateActorStatus(t, ctx, persistence, got, func(s *ateapi.ActorStatus) {
+		s.LastAssignedGeneration = 2
+		s.Snapshots = append(s.Snapshots, proto.CloneOf(paused))
+	})
+	report := &ateletpb.SnapshotReport{Snapshot: &ateletpb.Snapshot{
+		SnapshotUuid: paused.GetUuid(),
+		Generation:   paused.GetGeneration(),
+		Fidelity:     fidelityToAtelet(paused.GetFidelity()),
+		Object:       &ateletpb.ObjectStorage{SnapshotUri: pausedURI.String()},
+	}}
+	atelet.promoteState = &ateletpb.ActorSnapshotState{LatestLocal: report, LatestDurable: proto.CloneOf(report)}
+
+	tag, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v2"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+	if got := atelet.promoteRequest(); got.GetSnapshot().GetSnapshotUuid() != paused.GetUuid() {
+		t.Errorf("PromoteSnapshot request = %v, want one for snapshot %q", got, paused.GetUuid())
+	}
+	stored, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if stored.GetStatus().GetState() != ateapi.ActorState_ACTOR_STATE_RUNNING {
+		t.Errorf("actor state = %v, want RUNNING", stored.GetStatus().GetState())
+	}
+	wantPaused := proto.CloneOf(paused)
+	wantPaused.DurableSnapshot.State = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+	if diff := cmp.Diff(wantPaused, findSnapshotByGeneration(stored.GetStatus().GetSnapshots(), 2), protocmp.Transform()); diff != "" {
+		t.Errorf("the actor's latest snapshot mismatch (-want +got):\n%s", diff)
+	}
+	tagSnapshot = tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+	if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+		t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+}
+
 // TestTagActorSnapshot_Preconditions verifies what a tag may be taken from:
-// a suspended actor's finished external snapshot, and nothing else.
+// the finished external snapshot of a suspended or running actor, and nothing
+// else.
 func TestTagActorSnapshot_Preconditions(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -200,8 +288,15 @@ func TestTagActorSnapshot_Preconditions(t *testing.T) {
 		wantCode        codes.Code
 	}{
 		{
-			name:            "the actor is not suspended",
-			state:           ateapi.ActorState_ACTOR_STATE_RUNNING,
+			name:            "the actor is suspending",
+			state:           ateapi.ActorState_ACTOR_STATE_SUSPENDING,
+			withSnapshot:    true,
+			builtOnTemplate: true,
+			wantCode:        codes.FailedPrecondition,
+		},
+		{
+			name:            "the actor is resuming",
+			state:           ateapi.ActorState_ACTOR_STATE_RESUMING,
 			withSnapshot:    true,
 			builtOnTemplate: true,
 			wantCode:        codes.FailedPrecondition,

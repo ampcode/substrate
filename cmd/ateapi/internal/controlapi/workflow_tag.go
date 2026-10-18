@@ -30,8 +30,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// TagActorSnapshot tags the external snapshot held by the suspended actor the
-// tag's source_actor names.
+// TagActorSnapshot tags the external snapshot held by the actor the tag's
+// source_actor names: a suspended actor's latest snapshot, or the snapshot a
+// running actor's last suspend uploaded.
 // The tag is given its own copy of that snapshot, so suspending the actor again
 // or deleting the actor does not garbage collect the tag's snapshot.
 //
@@ -233,7 +234,7 @@ func (w *ActorWorkflow) finalizeTagDeleted(ctx context.Context, tag *ateapi.Tag)
 }
 
 // loadActorForTag fetches the actor to tag and its template, and checks that
-// the actor is suspended.
+// the actor is suspended or running.
 func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.ActorRef) (_ *ateapi.Actor, _ *ateapi.ActorTemplate, err error) {
 	ctx, done := stepSpan(ctx, "LoadActorForTag")
 	defer func() { err = done(err) }()
@@ -242,10 +243,15 @@ func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.
 	if err != nil {
 		return nil, nil, err
 	}
-	// Only a suspended actor's snapshot is complete. A running or
-	// suspending actor's is either stale or still being written.
-	if got := actor.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_SUSPENDED {
-		return nil, nil, apierror.FailedPrecondition("Actor %s must be %s to be tagged (got: %v)", actorRef, ateapi.ActorState_ACTOR_STATE_SUSPENDED, got)
+	// A suspended actor's latest snapshot is its state. A running actor's is
+	// the state its last suspend captured: resuming leaves the record as it
+	// was, and the actor's lease, held here, keeps the suspend or revert that
+	// would replace it from collecting it under the copy. A transitioning
+	// actor's is still being written or torn down.
+	switch got := actor.GetStatus().GetState(); got {
+	case ateapi.ActorState_ACTOR_STATE_SUSPENDED, ateapi.ActorState_ACTOR_STATE_RUNNING:
+	default:
+		return nil, nil, apierror.FailedPrecondition("Actor %s must be %s or %s to be tagged (got: %v)", actorRef, ateapi.ActorState_ACTOR_STATE_SUSPENDED, ateapi.ActorState_ACTOR_STATE_RUNNING, got)
 	}
 	actorTemplate, err := resolveActorTemplate(ctx, w.store, actor)
 	if err != nil {

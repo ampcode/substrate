@@ -90,10 +90,11 @@ service Control {
     option (method).resource = "Actor";
   }
 
-  // Tag the external snapshot a suspended Actor holds. The tag gets its own
-  // copy of that snapshot, so suspending or deleting the Actor afterwards
-  // cannot collect it. When the Actor's latest snapshot is not uploaded yet,
-  // atelet uploads it first, so the call can take as long as that upload.
+  // Tag the external snapshot a suspended Actor holds, or the one a running
+  // Actor's last suspend took. The tag gets its own copy of that snapshot, so
+  // suspending or deleting the Actor afterwards cannot collect it. When that
+  // snapshot is not uploaded yet, atelet uploads it first, so the call can
+  // take as long as that upload.
   rpc CreateTag(CreateTagRequest) returns (Tag) {
     option (method).resource = "Tag";
   }
@@ -1106,9 +1107,10 @@ message Tag {
   // +k8s:maximum=2 # keep this in sync with the TagScope enum
   TagScope scope = 3;
 
-  // source_actor is the suspended Actor whose external snapshot this tag
-  // captures. The tag lives in this Actor's Atespace. Set once at creation and
-  // immutable afterward.
+  // source_actor is the Actor whose external snapshot this tag captures: a
+  // suspended Actor's latest snapshot, or the snapshot a running Actor's last
+  // suspend took. The tag lives in this Actor's Atespace. Set once at creation
+  // and immutable afterward.
   //
   // +k8s:required
   // +k8s:subfield(atespace)=+k8s:required
@@ -2029,13 +2031,18 @@ message ListTagsResponse {
   string next_page_token = 2;
 }
 
-// Request to tag the external snapshot a suspended Actor holds.
+// Request to tag the external snapshot a suspended Actor holds, or the one a
+// running Actor's last suspend took.
 //
 // The tag captures whichever snapshot the Actor holds when the call runs. An
 // Actor keeps no snapshot history — each suspend replaces the last — so a
 // suspend that lands between taking a snapshot and tagging it moves what gets
 // tagged. That race is inherent and accepted: the tag means "the Actor as of
 // this call", not "the snapshot some earlier suspend returned".
+//
+// A running Actor is tagged with the snapshot its last suspend took, not its
+// live state. When a pause's node-local snapshot is not uploaded yet, the
+// atelet on its node uploads it first, as for a suspended Actor.
 //
 // The tag is given its own copy of that snapshot, so it survives the Actor
 // being suspended again or deleted.

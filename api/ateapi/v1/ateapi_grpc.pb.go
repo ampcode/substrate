@@ -114,10 +114,11 @@ type ControlClient interface {
 	//
 	// * Called by the egress gateway when actor JWT injection is configured for outbound requests.
 	MintActorJwt(ctx context.Context, in *MintActorJwtRequest, opts ...grpc.CallOption) (*MintActorJwtResponse, error)
-	// Tag the external snapshot a suspended Actor holds. The tag gets its own
-	// copy of that snapshot, so suspending or deleting the Actor afterwards
-	// cannot collect it. When the Actor's latest snapshot is not uploaded yet,
-	// atelet uploads it first, so the call can take as long as that upload.
+	// Tag the external snapshot a suspended Actor holds, or the one a running
+	// Actor's last suspend took. The tag gets its own copy of that snapshot, so
+	// suspending or deleting the Actor afterwards cannot collect it. When that
+	// snapshot is not uploaded yet, atelet uploads it first, so the call can
+	// take as long as that upload.
 	CreateTag(ctx context.Context, in *CreateTagRequest, opts ...grpc.CallOption) (*Tag, error)
 	// Get a Tag.
 	GetTag(ctx context.Context, in *GetTagRequest, opts ...grpc.CallOption) (*Tag, error)
@@ -662,10 +663,11 @@ type ControlServer interface {
 	//
 	// * Called by the egress gateway when actor JWT injection is configured for outbound requests.
 	MintActorJwt(context.Context, *MintActorJwtRequest) (*MintActorJwtResponse, error)
-	// Tag the external snapshot a suspended Actor holds. The tag gets its own
-	// copy of that snapshot, so suspending or deleting the Actor afterwards
-	// cannot collect it. When the Actor's latest snapshot is not uploaded yet,
-	// atelet uploads it first, so the call can take as long as that upload.
+	// Tag the external snapshot a suspended Actor holds, or the one a running
+	// Actor's last suspend took. The tag gets its own copy of that snapshot, so
+	// suspending or deleting the Actor afterwards cannot collect it. When that
+	// snapshot is not uploaded yet, atelet uploads it first, so the call can
+	// take as long as that upload.
 	CreateTag(context.Context, *CreateTagRequest) (*Tag, error)
 	// Get a Tag.
 	GetTag(context.Context, *GetTagRequest) (*Tag, error)
