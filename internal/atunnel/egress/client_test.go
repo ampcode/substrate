@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -306,6 +307,99 @@ func TestClientDialContextHTTP2ReconnectsAfterConnectionClose(t *testing.T) {
 	}
 	if dials := tcpDials.Load(); dials != 2 {
 		t.Errorf("tcpDials = %d, want 2", dials)
+	}
+}
+
+// The gateway authenticates every CONNECT against the certificate of the TLS
+// handshake that carries it. A pooled HTTP/2 connection therefore has to be
+// retired when the actor certificate is renewed, or every stream on it is
+// refused once the old certificate expires.
+func TestClientDialContextHTTP2ReconnectsAfterCertificateRotation(t *testing.T) {
+	ca := newTestCA(t)
+	const spiffeID = "spiffe://substrate-actor.local/worker-for-actor/team/actor"
+
+	// Serial numbers of the client certificates, one per TLS handshake. CONNECT
+	// requests carry no scheme, so the HTTP/2 server leaves r.TLS nil and the
+	// handshake is the only place to observe which certificate a connection uses.
+	var serialsMu sync.Mutex
+	var handshakeSerials []string
+	gatewayAddress, _ := serveTestH2ConnectGatewayWithTLS(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = io.Copy(w, r.Body)
+	}), func(config *tls.Config) {
+		config.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			leaf, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return err
+			}
+			serialsMu.Lock()
+			handshakeSerials = append(handshakeSerials, leaf.SerialNumber.String())
+			serialsMu.Unlock()
+			return nil
+		}
+	})
+
+	trustPath := filepath.Join(t.TempDir(), "trust.pem")
+	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial := ca.issue(t, spiffeID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	var certMu sync.Mutex
+	current := initial
+	var tcpDials atomic.Int32
+	client, err := NewClient(ClientConfig{
+		GatewayAddress: "127.0.0.1:1",
+		ServerName:     "egress.test",
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			certMu.Lock()
+			defer certMu.Unlock()
+			cert := current
+			return &cert, nil
+		},
+		TrustBundlePath: trustPath,
+	}, withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		tcpDials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, gatewayAddress)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	dial := func(destination string) {
+		t.Helper()
+		conn, err := client.DialContext(context.Background(), destination)
+		if err != nil {
+			t.Fatalf("DialContext(%s): %v", destination, err)
+		}
+		_ = conn.Close()
+	}
+
+	dial("192.0.2.10:443")
+	dial("192.0.2.11:443")
+	if got := tcpDials.Load(); got != 1 {
+		t.Fatalf("tcpDials before rotation = %d, want 1 shared HTTP/2 connection", got)
+	}
+
+	renewed := ca.issue(t, spiffeID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	certMu.Lock()
+	current = renewed
+	certMu.Unlock()
+
+	dial("192.0.2.12:443")
+	dial("192.0.2.13:443")
+	if got := tcpDials.Load(); got != 2 {
+		t.Errorf("tcpDials after rotation = %d, want 2: one connection per certificate", got)
+	}
+
+	serialsMu.Lock()
+	defer serialsMu.Unlock()
+	want := []string{initial.Leaf.SerialNumber.String(), renewed.Leaf.SerialNumber.String()}
+	if !slices.Equal(handshakeSerials, want) {
+		t.Errorf("gateway handshake certificate serials = %v, want %v", handshakeSerials, want)
 	}
 }
 
@@ -696,6 +790,13 @@ func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *ht
 
 func serveTestH2ConnectGateway(t *testing.T, ca *testCA, handler http.Handler) (string, func()) {
 	t.Helper()
+	return serveTestH2ConnectGatewayWithTLS(t, ca, handler, nil)
+}
+
+// serveTestH2ConnectGatewayWithTLS is serveTestH2ConnectGateway with a hook to
+// adjust the server's TLS configuration, for example to observe handshakes.
+func serveTestH2ConnectGatewayWithTLS(t *testing.T, ca *testCA, handler http.Handler, configureTLS func(*tls.Config)) (string, func()) {
+	t.Helper()
 	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -728,6 +829,9 @@ func serveTestH2ConnectGateway(t *testing.T, ca *testCA, handler http.Handler) (
 			ClientCAs:    clientCAs,
 			NextProtos:   []string{"h2"},
 		},
+	}
+	if configureTLS != nil {
+		configureTLS(server.TLSConfig)
 	}
 	tlsListener := tls.NewListener(trackingListener, server.TLSConfig)
 	t.Cleanup(func() { _ = server.Close() })
