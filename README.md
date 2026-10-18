@@ -139,6 +139,12 @@ upstream ships its equivalent. The series is:
   snapshot its last suspend uploaded, so a live sandbox can be snapshotted
   with `SuspendActor(ASYNCHRONOUS)` → `ResumeActor` → `CreateTag` once the
   upload completes, instead of staying frozen through the upload and copy.
+- `internal/atunnel/egress`: pooled HTTP/2 connections to the egress gateway
+  are retired when the actor certificate rotates. The gateway verifies the
+  handshake certificate on every CONNECT, and a busy actor keeps the pooled
+  connection alive past the 30s idle timeout, so without this every new
+  outbound connection fails one hour (the certificate lifetime) after the actor
+  last started or resumed. Upstream still carries a TODO for this.
 
 Dropped from earlier versions of this series because upstream now ships the
 equivalent: `RLIMIT_NOFILE` raising, ECR image-pull auth (kubelet credential
