@@ -154,8 +154,61 @@ func TestTagActorSnapshot_ActorRepointedToAnotherTemplate(t *testing.T) {
 	}
 }
 
+// TestTagActorSnapshot_RunningActor verifies that a running actor can be
+// tagged with the snapshot its last suspend uploaded, the state a resume
+// leaves recorded, and that a running actor whose latest snapshot is still
+// node-local cannot.
+func TestTagActorSnapshot_RunningActor(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actor, actorSnapshot := seedTagSource(t, ctx, persistence, objects, template, "actor-1", "manifest.json", "rootfs.zst")
+	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+		s.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+		s.AssignedNode = "node-1"
+		s.WorkerAssignment = &ateapipb.WorkerAssignment{NodeName: "node-1", WorkerPod: "worker-1"}
+	})
+	actorRef := resources.ActorRefFromActor(actor)
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+	tagSnapshot := tagDurableSnapshotURI(tag, ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	if tagSnapshot == "" || tagSnapshot == actorSnapshot.String() {
+		t.Fatalf("tag snapshot uri = %q, want a copy of its own rather than the actor's %q", tagSnapshot, actorSnapshot)
+	}
+	wantObjects := []string{"manifest.json", "rootfs.zst"}
+	if diff := cmp.Diff(wantObjects, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+		t.Errorf("the tag's external snapshot mismatch (-want +got):\n%s", diff)
+	}
+	// The running actor is left as it was: still running, its snapshot intact.
+	got, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if diff := cmp.Diff(actor.GetStatus(), got.GetStatus(), protocmp.Transform()); diff != "" {
+		t.Errorf("actor status changed by the tag (-want +got):\n%s", diff)
+	}
+
+	// A pause after that leaves a newer node-local snapshot above the
+	// uploaded one; until atelet reports its upload, the actor's latest state
+	// is not in object storage and the running actor cannot be tagged.
+	mustUpdateActorStatus(t, ctx, persistence, got, func(s *ateapipb.ActorStatus) {
+		s.LastAssignedGeneration = 2
+		s.Snapshots = append(s.Snapshots, newPausedSnapshot(t, 2, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, template.GetMetadata().GetUid(), "paused", "node-1"))
+	})
+	_, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v2"))
+	if code := apierror.Code(err); code != codes.FailedPrecondition {
+		t.Fatalf("TagActorSnapshot error = %v (code %v), want code %v", err, code, codes.FailedPrecondition)
+	}
+}
+
 // TestTagActorSnapshot_Preconditions verifies what a tag may be taken from:
-// a suspended actor's finished external snapshot, and nothing else.
+// the finished external snapshot of a suspended or running actor, and nothing
+// else.
 func TestTagActorSnapshot_Preconditions(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -171,8 +224,15 @@ func TestTagActorSnapshot_Preconditions(t *testing.T) {
 		wantCode codes.Code
 	}{
 		{
-			name:            "the actor is not suspended",
-			state:           ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			name:            "the actor is suspending",
+			state:           ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
+			withSnapshot:    true,
+			builtOnTemplate: true,
+			wantCode:        codes.FailedPrecondition,
+		},
+		{
+			name:            "the actor is resuming",
+			state:           ateapipb.ActorState_ACTOR_STATE_RESUMING,
 			withSnapshot:    true,
 			builtOnTemplate: true,
 			wantCode:        codes.FailedPrecondition,

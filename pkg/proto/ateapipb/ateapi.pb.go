@@ -2438,9 +2438,10 @@ type Tag struct {
 	// +k8s:minimum=1
 	// +k8s:maximum=2 # keep this in sync with the TagScope enum
 	Scope TagScope `protobuf:"varint,3,opt,name=scope,proto3,enum=ateapi.TagScope" json:"scope,omitempty"`
-	// source_actor is the suspended Actor whose external snapshot this tag
-	// captures. The tag lives in this Actor's Atespace. Set once at creation and
-	// immutable afterward.
+	// source_actor is the Actor whose external snapshot this tag captures: a
+	// suspended Actor's latest snapshot, or the snapshot a running Actor's last
+	// suspend uploaded. The tag lives in this Actor's Atespace. Set once at
+	// creation and immutable afterward.
 	//
 	// +k8s:required
 	// +k8s:subfield(atespace)=+k8s:required
@@ -5983,13 +5984,20 @@ func (x *ListTagsResponse) GetNextPageToken() string {
 	return ""
 }
 
-// Request to tag the external snapshot a suspended Actor holds.
+// Request to tag the external snapshot a suspended Actor holds, or the one a
+// running Actor's last suspend uploaded.
 //
 // The tag captures whichever snapshot the Actor holds when the call runs. An
 // Actor keeps no snapshot history — each suspend replaces the last — so a
 // suspend that lands between taking a snapshot and tagging it moves what gets
 // tagged. That race is inherent and accepted: the tag means "the Actor as of
 // this call", not "the snapshot some earlier suspend returned".
+//
+// A running Actor is tagged with the snapshot its last suspend took, not its
+// live state, and only once that snapshot is in object storage: until atelet
+// has uploaded a pause's node-local snapshot, the call fails with
+// FAILED_PRECONDITION and can be retried once the Actor's latest snapshot
+// records a COMPLETED durable copy.
 //
 // The tag is given its own copy of that snapshot, so it survives the Actor
 // being suspended again or deleted.
