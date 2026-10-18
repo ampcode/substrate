@@ -16,6 +16,7 @@ package egress
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -86,7 +87,11 @@ func withDialer(dial dialFunc) clientOption {
 type Client struct {
 	gatewayAddress string
 	tlsConfig      *tls.Config
-	dialContext    dialFunc
+	// getClientCertificate is the actor credential source. Pooled HTTP/2
+	// connections remember the certificate they handshook with, so a rotated
+	// credential retires them instead of riding on the old one.
+	getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	dialContext          dialFunc
 
 	mu      sync.Mutex
 	closed  bool
@@ -121,14 +126,14 @@ func NewClient(cfg ClientConfig, opts ...clientOption) (*Client, error) {
 	}
 
 	client := &Client{
-		gatewayAddress: cfg.GatewayAddress,
-		dialContext:    (&net.Dialer{}).DialContext,
+		gatewayAddress:       cfg.GatewayAddress,
+		getClientCertificate: cfg.GetClientCertificate,
+		dialContext:          (&net.Dialer{}).DialContext,
 		tlsConfig: &tls.Config{
-			MinVersion:           tls.VersionTLS12,
-			RootCAs:              rootCAs,
-			ServerName:           cfg.ServerName,
-			GetClientCertificate: cfg.GetClientCertificate,
-			NextProtos:           []string{"h2", "http/1.1"},
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+			ServerName: cfg.ServerName,
+			NextProtos: []string{"h2", "http/1.1"},
 		},
 	}
 	for _, opt := range opts {
@@ -201,7 +206,11 @@ func (c *Client) acquireConn(ctx context.Context) (*h2ClientConn, bool, *tls.Con
 		}
 
 		// First check if there is an existing H/2 connection with available stream capacity.
-		// TODO(yanavlasov): do not use existing H/2 connections if their keys have been rotated.
+		// The gateway verifies the handshake certificate on every CONNECT, so a
+		// connection that handshook with a since-rotated actor certificate is
+		// refused once that certificate expires. Only connections carrying the
+		// current certificate take new streams; stale ones drain and close.
+		current := c.currentCertificate()
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
@@ -215,6 +224,14 @@ func (c *Client) acquireConn(ctx context.Context) (*h2ClientConn, bool, *tls.Con
 		// At the same time, discard these that are closed, or idle and GOAWAY'ed.
 		for _, h2Conn := range c.h2Conns {
 			if h2Conn.isClosed() {
+				continue
+			}
+			if current != nil && !h2Conn.handshookWith(current) {
+				if h2Conn.cc.InFlight() == 0 {
+					_ = h2Conn.cc.Close()
+					continue
+				}
+				keep = append(keep, h2Conn)
 				continue
 			}
 			if reserved == nil {
@@ -327,12 +344,23 @@ func (c *Client) runDial(dialCtx context.Context, call *dialCall) {
 	if dialErr != nil {
 		err = fmt.Errorf("egress: connecting to egress gateway: %w", dialErr)
 	} else {
-		tlsConn := tls.Client(rawConn, c.tlsConfig.Clone())
+		// Remember the certificate this handshake presents: the pooled
+		// connection is only reused while it is still the current one.
+		var presented *tls.Certificate
+		tlsConfig := c.tlsConfig.Clone()
+		tlsConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			cert, err := c.getClientCertificate(info)
+			if err == nil {
+				presented = cert
+			}
+			return cert, err
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
 		if hsErr := tlsConn.HandshakeContext(dialCtx); hsErr != nil {
 			_ = rawConn.Close()
 			err = fmt.Errorf("%w: %w", ErrGatewayHandshake, hsErr)
 		} else if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-			h2Conn, err = c.newH2ClientConn(dialCtx, tlsConn)
+			h2Conn, err = c.newH2ClientConn(dialCtx, tlsConn, presented)
 		} else {
 			h1Conn = tlsConn
 		}
@@ -371,7 +399,17 @@ func (c *Client) runDial(dialCtx context.Context, call *dialCall) {
 	c.mu.Unlock()
 }
 
-func (c *Client) newH2ClientConn(ctx context.Context, tlsConn *tls.Conn) (*h2ClientConn, error) {
+// currentCertificate is the credential a handshake started now would present,
+// or nil when the source has none to offer.
+func (c *Client) currentCertificate() *tls.Certificate {
+	cert, err := c.getClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil || cert == nil || len(cert.Certificate) == 0 {
+		return nil
+	}
+	return cert
+}
+
+func (c *Client) newH2ClientConn(ctx context.Context, tlsConn *tls.Conn, presented *tls.Certificate) (*h2ClientConn, error) {
 	raw := &trackedTLSConn{Conn: tlsConn}
 	var protocols http.Protocols
 	protocols.SetHTTP2(true)
@@ -391,12 +429,16 @@ func (c *Client) newH2ClientConn(ctx context.Context, tlsConn *tls.Conn) (*h2Cli
 		}
 		return nil, connectExchangeError("writing CONNECT request", connErr)
 	}
-	return &h2ClientConn{
+	h2Conn := &h2ClientConn{
 		cc:         cc,
 		raw:        raw,
 		localAddr:  tlsConn.LocalAddr(),
 		remoteAddr: tlsConn.RemoteAddr(),
-	}, nil
+	}
+	if presented != nil && len(presented.Certificate) > 0 {
+		h2Conn.leafDER = presented.Certificate[0]
+	}
+	return h2Conn, nil
 }
 
 func (c *Client) removeH2Conn(target *h2ClientConn) {
@@ -525,6 +567,16 @@ type h2ClientConn struct {
 	// Used to distinguish between connection establishment errors and errors
 	// on an already working connection.
 	verified atomic.Bool
+	// leafDER is the actor certificate presented in this connection's TLS
+	// handshake; the gateway authenticates every CONNECT on it against that
+	// certificate, however many renewals have happened since.
+	leafDER []byte
+}
+
+// handshookWith reports whether the connection presented cert, so that the
+// gateway still accepts its CONNECTs after a credential rotation.
+func (h *h2ClientConn) handshookWith(cert *tls.Certificate) bool {
+	return len(h.leafDER) > 0 && bytes.Equal(h.leafDER, cert.Certificate[0])
 }
 
 func (h *h2ClientConn) isClosed() bool {
