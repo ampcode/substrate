@@ -661,7 +661,7 @@ func createWorkerPool(t *testing.T, tc *testContext, ns string, name string, lab
 			Labels:    labels,
 		},
 		Spec: atev1alpha1.WorkerPoolSpec{
-			Replicas:       1,
+			Replicas:       ptr.To(int32(1)),
 			WorkerImage:    "worker@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 			SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{Name: atev1alpha1.SandboxClassGvisor}},
 		},

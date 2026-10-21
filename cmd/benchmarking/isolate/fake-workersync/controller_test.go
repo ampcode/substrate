@@ -357,7 +357,7 @@ func (f *fakeCluster) setReplicas(pool string, n int32) {
 	for i, p := range f.pools {
 		if p.Name == pool {
 			c := p.DeepCopy()
-			c.Spec.Replicas = n
+			c.Spec.Replicas = &n
 			f.pools[i] = c
 		}
 	}
@@ -366,7 +366,7 @@ func (f *fakeCluster) setReplicas(pool string, n int32) {
 func pool(name string, replicas int32, limits corev1.ResourceList) *atev1alpha1.WorkerPool {
 	wp := &atev1alpha1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "benchmark-workloads", Name: name, Labels: map[string]string{"workload": name}},
-		Spec:       atev1alpha1.WorkerPoolSpec{Replicas: replicas, SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{Name: atev1alpha1.SandboxClassGvisor}}},
+		Spec:       atev1alpha1.WorkerPoolSpec{Replicas: &replicas, SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{Name: atev1alpha1.SandboxClassGvisor}}},
 	}
 	if limits != nil {
 		wp.Spec.Template = &atev1alpha1.WorkerPoolPodTemplate{Resources: &corev1.ResourceRequirements{Limits: limits}}

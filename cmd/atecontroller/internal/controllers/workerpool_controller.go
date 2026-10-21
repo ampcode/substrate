@@ -172,7 +172,7 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	// Deployment is applied first. A SandboxConfig error never holds back a
 	// scale.
 	if existing != nil {
-		if err := r.applyDeployment(ctx, wp); err != nil {
+		if err := r.applyDeployment(ctx, wp, existing); err != nil {
 			return err
 		}
 	}
@@ -205,7 +205,7 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	// A pool without a Deployment gets one only once every sandbox class has
 	// a config.
 	if existing == nil && everyClassHasConfig(classes) {
-		return r.applyDeployment(ctx, wp)
+		return r.applyDeployment(ctx, wp, nil)
 	}
 	return nil
 }
@@ -323,7 +323,10 @@ func (r *WorkerPoolReconciler) recordSandboxConfigEvents(wp *atev1alpha1.WorkerP
 	}
 }
 
-func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alpha1.WorkerPool) error {
+// applyDeployment writes the pool's Deployment. existing is the Deployment
+// as it is now, or nil. A spec without replicas leaves the count to the
+// scale subresource, so the Deployment keeps what it has (0 for a new pool).
+func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alpha1.WorkerPool, existing *appsv1.Deployment) error {
 	if wp.Spec.Template == nil || wp.Spec.Template.ServiceAccountName == nil {
 		if err := r.applyWorkerServiceAccount(ctx, wp.Namespace); err != nil {
 			return err
@@ -340,6 +343,11 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		Delivery:   r.PKIDelivery,
 		AgentImage: r.PodcertAgentImage,
 	})
+	replicas := wp.Spec.ReplicaCount()
+	if wp.Spec.Replicas == nil && existing != nil && existing.Spec.Replicas != nil {
+		replicas = *existing.Spec.Replicas
+	}
+	depAC.Spec.WithReplicas(replicas)
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
@@ -417,7 +425,7 @@ func (r *WorkerPoolReconciler) InitMetrics(meter metric.Meter) error {
 					ateattr.WorkerPoolNamespaceKey.String(wp.Namespace),
 					ateattr.WorkerPoolNameKey.String(wp.Name),
 				)
-				obs.ObserveInt64(r.desiredWorkers, int64(wp.Spec.Replicas), attrs)
+				obs.ObserveInt64(r.desiredWorkers, int64(wp.Spec.ReplicaCount()), attrs)
 				obs.ObserveInt64(r.readyWorkers, int64(wp.Status.ReadyReplicas), attrs)
 			}
 			return nil

@@ -804,7 +804,7 @@ func TestWorkerPoolUnresolvedKeepsConfigInUse(t *testing.T) {
 
 			if tc.missingRef != "" {
 				updateWorkerPoolSpec(t, ctx, wp, "point WorkerPool at a missing SandboxConfig and scale it", func(wp *atev1alpha1.WorkerPool) {
-					wp.Spec.Replicas = tc.replicas
+					wp.Spec.Replicas = ptr.To(tc.replicas)
 					wp.Spec.SandboxClasses[0].ConfigRef = &atev1alpha1.SandboxConfigReference{Name: tc.missingRef}
 				})
 			} else if err := k8sClient.Delete(ctx, tc.config); err != nil {
@@ -819,7 +819,7 @@ func TestWorkerPoolUnresolvedKeepsConfigInUse(t *testing.T) {
 
 			if tc.missingRef == "" {
 				updateWorkerPoolSpec(t, ctx, wp, "scale WorkerPool", func(wp *atev1alpha1.WorkerPool) {
-					wp.Spec.Replicas = tc.replicas
+					wp.Spec.Replicas = ptr.To(tc.replicas)
 				})
 			}
 			waitDeploymentReplicas(t, wp, tc.replicas)

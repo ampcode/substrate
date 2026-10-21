@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -83,7 +84,7 @@ func TestWorkerPoolFollowsClassDefault(t *testing.T) {
 	pool, err := clients.SubstrateK8s.ApiV1alpha1().WorkerPools(ns).Create(ctx, &atev1alpha1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "follows-default", Namespace: ns},
 		Spec: atev1alpha1.WorkerPoolSpec{
-			Replicas: 0,
+			Replicas: ptr.To(int32(0)),
 			// Never pulled: the pool runs no workers.
 			WorkerImage:    "worker:unused",
 			SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{Name: class}},

@@ -75,7 +75,10 @@ spec:
             description: spec defines the desired state of WorkerPool
             properties:
               replicas:
-                description: replicas is the number of worker pods to run.
+                description: |-
+                  replicas is the number of worker pods to run. When left out, the pool
+                  keeps the count it has now (0 for a new pool) and the scale
+                  subresource owns it.
                 format: int32
                 minimum: 0
                 type: integer
@@ -486,7 +489,6 @@ spec:
                 minLength: 1
                 type: string
             required:
-            - replicas
             - sandboxClasses
             - workerImage
             type: object

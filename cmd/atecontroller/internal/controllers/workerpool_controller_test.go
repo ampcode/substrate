@@ -182,7 +182,7 @@ func TestWorkerPoolReplicasUpdate(t *testing.T) {
 	})
 
 	updateWorkerPoolSpec(t, ctx, wp, "update WorkerPool replicas", func(current *atev1alpha1.WorkerPool) {
-		current.Spec.Replicas = 5
+		current.Spec.Replicas = ptr.To(int32(5))
 	})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
@@ -192,6 +192,48 @@ func TestWorkerPoolReplicasUpdate(t *testing.T) {
 		}
 		return dep.Spec.Replicas != nil && *dep.Spec.Replicas == 5, nil
 	})
+}
+
+// TestWorkerPoolReplicasDropped verifies that a WorkerPool whose
+// spec.replicas is removed keeps the Deployment's count and that the
+// controller does not write the field back.
+func TestWorkerPoolReplicasDropped(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-replicas-dropped", "default", 3, "worker:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+
+	eventually(t, func(ctx context.Context) (bool, error) {
+		dep, err := getDeployment(ctx, wp)
+		return err == nil && dep.Spec.Replicas != nil && *dep.Spec.Replicas == 3, nil
+	})
+
+	updateWorkerPoolSpec(t, ctx, wp, "drop WorkerPool replicas", func(current *atev1alpha1.WorkerPool) {
+		current.Spec.Replicas = nil
+		current.Spec.WorkerImage = "worker:v2"
+	})
+
+	eventually(t, func(ctx context.Context) (bool, error) {
+		dep, err := getDeployment(ctx, wp)
+		return err == nil && dep.Spec.Template.Spec.Containers[0].Image == "worker:v2", nil
+	})
+	dep, err := getDeployment(ctx, wp)
+	if err != nil {
+		t.Fatalf("get Deployment: %v", err)
+	}
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 3 {
+		t.Fatalf("Deployment replicas = %v, want 3", dep.Spec.Replicas)
+	}
+	current := &atev1alpha1.WorkerPool{}
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(wp), current); err != nil {
+		t.Fatalf("get WorkerPool: %v", err)
+	}
+	if current.Spec.Replicas != nil {
+		t.Fatalf("WorkerPool spec.replicas = %d, want unset", *current.Spec.Replicas)
+	}
 }
 
 // TestWorkerPoolImageUpdate verifies that changing spec.workerImage on a
@@ -667,7 +709,7 @@ func makeWorkerPool(name, ns string, replicas int32, image string) *atev1alpha1.
 	return &atev1alpha1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: atev1alpha1.WorkerPoolSpec{
-			Replicas:       replicas,
+			Replicas:       &replicas,
 			WorkerImage:    image,
 			SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{Name: atev1alpha1.SandboxClassGvisor}},
 		},
