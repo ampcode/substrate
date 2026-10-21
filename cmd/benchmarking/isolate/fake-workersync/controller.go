@@ -272,7 +272,7 @@ func (c *controller) reconcile(ctx context.Context) error {
 			held[wp.Namespace+"/"+wp.Name] = true
 			continue
 		}
-		for i := range int(wp.Spec.Replicas) {
+		for i := range int(wp.Spec.ReplicaCount()) {
 			desired[fakeworker.Name(c.run, wp.Namespace, wp.Name, i)] = desiredWorker{pool: wp, index: i}
 		}
 	}
@@ -552,7 +552,7 @@ func (c *controller) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool,
 		// A Worker its pool no longer wants, made from an older template, or
 		// off the fake-atelet nodes is no replica even before its drain lands.
 		if w.namespace != wp.Namespace || w.pool != wp.Name || !w.created || w.draining ||
-			w.index >= int(wp.Spec.Replicas) || !onFakeAteletNode(w) || !fits(w, wp, allocatable) {
+			w.index >= int(wp.Spec.ReplicaCount()) || !onFakeAteletNode(w) || !fits(w, wp, allocatable) {
 			continue
 		}
 		want.Replicas++

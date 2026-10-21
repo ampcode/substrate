@@ -86,10 +86,12 @@ type WorkerPoolPodTemplate struct {
 }
 
 type WorkerPoolSpec struct {
-	// replicas is the number of worker pods to run.
-	// +required
+	// replicas is the number of worker pods to run. When left out, the pool
+	// keeps the count it has now (0 for a new pool) and the scale
+	// subresource owns it.
+	// +optional
 	// +kubebuilder:validation:Minimum=0
-	Replicas int32 `json:"replicas"`
+	Replicas *int32 `json:"replicas,omitempty"`
 
 	// workerImage is the worker container image to deploy as workers.
 	// +kubebuilder:validation:MinLength=1
@@ -142,6 +144,14 @@ type SandboxConfigReference struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name,omitempty"`
+}
+
+// ReplicaCount returns spec.replicas, 0 when it is not set yet.
+func (s *WorkerPoolSpec) ReplicaCount() int32 {
+	if s.Replicas == nil {
+		return 0
+	}
+	return *s.Replicas
 }
 
 // DefaultSandboxClass returns the sandbox class of the pool's first

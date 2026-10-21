@@ -277,7 +277,6 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSetti
 			WithController(true).
 			WithBlockOwnerDeletion(true)).
 		WithSpec(appsv1ac.DeploymentSpec().
-			WithReplicas(wp.Spec.Replicas).
 			WithStrategy(appsv1ac.DeploymentStrategy().
 				WithType(appsv1.RollingUpdateDeploymentStrategyType).
 				WithRollingUpdate(appsv1ac.RollingUpdateDeployment().

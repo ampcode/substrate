@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 const gpuResourceName = corev1.ResourceName("nvidia.com/gpu")
@@ -42,7 +43,7 @@ func TestWorkerPoolValidation(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: WorkerPoolSpec{
-			Replicas:       1,
+			Replicas:       ptr.To(int32(1)),
 			WorkerImage:    "worker:latest",
 			SandboxClasses: []WorkerPoolSandboxClass{{Name: SandboxClassGvisor}},
 		},
@@ -60,7 +61,7 @@ func TestWorkerPoolValidation(t *testing.T) {
 	}, {
 		name: "replicas below minimum",
 		mutate: func(wp *WorkerPool) {
-			wp.Spec.Replicas = -1
+			wp.Spec.Replicas = ptr.To(int32(-1))
 		},
 		wantErr: true,
 		errMsg:  "spec.replicas: Invalid value: -1: spec.replicas in body should be greater than or equal to 0",
@@ -301,7 +302,7 @@ func TestWorkerPoolReservedMetadataUpdate(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: WorkerPoolSpec{
-			Replicas:       1,
+			Replicas:       ptr.To(int32(1)),
 			WorkerImage:    "example.com/worker:latest",
 			SandboxClasses: []WorkerPoolSandboxClass{{Name: SandboxClassGvisor}},
 		},
@@ -352,7 +353,7 @@ func TestWorkerPoolSandboxClassesUpdate(t *testing.T) {
 					Namespace: "default",
 				},
 				Spec: WorkerPoolSpec{
-					Replicas:       1,
+					Replicas:       ptr.To(int32(1)),
 					WorkerImage:    "example.com/worker:latest",
 					SandboxClasses: []WorkerPoolSandboxClass{{Name: SandboxClassGvisor}},
 				},

@@ -828,7 +828,7 @@ func testWorkerPoolApplyConfig(tmpl *atev1alpha1.WorkerPoolPodTemplate) *atev1al
 	return &atev1alpha1.WorkerPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default", UID: "uid"},
 		Spec: atev1alpha1.WorkerPoolSpec{
-			Replicas:    2,
+			Replicas:    ptr.To(int32(2)),
 			WorkerImage: "worker:v1",
 			Template:    tmpl,
 		},
@@ -986,7 +986,6 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 			WithController(true).
 			WithBlockOwnerDeletion(true)).
 		WithSpec(appsv1ac.DeploymentSpec().
-			WithReplicas(wp.Spec.Replicas).
 			WithStrategy(appsv1ac.DeploymentStrategy().
 				WithType(appsv1.RollingUpdateDeploymentStrategyType).
 				WithRollingUpdate(appsv1ac.RollingUpdateDeployment().

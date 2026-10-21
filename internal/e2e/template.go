@@ -85,7 +85,7 @@ func CreateSubstrateTemplateFrom(ctx context.Context, t *testing.T, clients *Cli
 			Labels:    opts.Labels,
 		},
 		Spec: v1alpha1.WorkerPoolSpec{
-			Replicas:       opts.PoolReplicas,
+			Replicas:       &opts.PoolReplicas,
 			WorkerImage:    existingWp.Spec.WorkerImage,
 			SandboxClasses: existingWp.Spec.SandboxClasses,
 		},
