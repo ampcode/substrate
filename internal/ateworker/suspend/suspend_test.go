@@ -16,6 +16,7 @@ package suspend
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"slices"
@@ -43,6 +44,9 @@ type capturingAtelet struct {
 	ateletpb.UnimplementedWorkerSupportServer
 
 	errs []error
+	// onRequest, when set, runs with the zero-based attempt before it is
+	// answered.
+	onRequest func(attempt int)
 
 	mu  sync.Mutex
 	got []*ateletpb.RequestActorSuspendRequest
@@ -54,6 +58,9 @@ func (a *capturingAtelet) RequestActorSuspend(_ context.Context, in *ateletpb.Re
 	a.got = append(a.got, in)
 	a.mu.Unlock()
 
+	if a.onRequest != nil {
+		a.onRequest(attempt)
+	}
 	if attempt < len(a.errs) {
 		return nil, a.errs[attempt]
 	}
@@ -67,10 +74,18 @@ func (a *capturingAtelet) requests() []*ateletpb.RequestActorSuspendRequest {
 	return slices.Clone(a.got)
 }
 
-// testBackoff retries as many times as production does, without the waiting.
+// testBackoff retries the way production does, without the waiting.
 func testBackoff() wait.Backoff {
-	return wait.Backoff{Steps: retrySteps, Duration: time.Millisecond}
+	b := retryBackoff()
+	b.Duration = time.Millisecond
+	b.Cap = time.Millisecond
+	return b
 }
+
+// manyRefusals is more refusals than any test lets the atelet be asked, so a
+// retry past the point under test is answered rather than accepted and shows
+// up in the count.
+const manyRefusals = 100
 
 // dialCapturingAtelet serves an in-process WorkerSupport over bufconn, which
 // exercises the request without a socket or certificates.
@@ -119,9 +134,9 @@ func TestRequestSuspendNamesTheActor(t *testing.T) {
 	}
 }
 
-// The reason the retry exists: a caller that pushed an idleness signal may
-// never push another, so a control plane that was briefly out of reach must
-// not be what costs the platform a worker slot.
+// The reason the retry exists: a worker shutting down asks once per actor, so
+// a control plane that was briefly out of reach must not be what crashes the
+// actor.
 func TestRequestSuspendRidesOutATransientFailure(t *testing.T) {
 	atelet := &capturingAtelet{errs: []error{
 		status.Error(codes.Unavailable, "atelet restarting"),
@@ -149,9 +164,7 @@ func TestRequestSuspendDoesNotRetryADecision(t *testing.T) {
 		{"malformed", status.Error(codes.InvalidArgument, "actor_uid is required")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// One more refusal than there are attempts, so a retry would be
-			// answered rather than accepted and would show up in the count.
-			atelet := &capturingAtelet{errs: slices.Repeat([]error{tc.err}, retrySteps+1)}
+			atelet := &capturingAtelet{errs: slices.Repeat([]error{tc.err}, manyRefusals)}
 			conn := dialCapturingAtelet(t, atelet)
 
 			err := requestWithRetry(context.Background(), conn, Actor{Atespace: "team-a", Name: "actor-1", UID: "actor-uid-1"}, testBackoff())
@@ -165,36 +178,71 @@ func TestRequestSuspendDoesNotRetryADecision(t *testing.T) {
 	}
 }
 
-// The budget is bounded. An idleness signal decays, so a request that cannot
-// be delivered is eventually dropped rather than landing on an actor that has
-// since picked up work.
-func TestRequestSuspendGivesUpAndSaysWhy(t *testing.T) {
-	unavailable := status.Error(codes.Unavailable, "atelet restarting")
-	atelet := &capturingAtelet{errs: slices.Repeat([]error{unavailable}, retrySteps+1)}
+// The budget is the caller's context, not a count of attempts. An atelet that
+// was rolled off the node is gone for minutes, not seconds, and a worker with
+// time left on its grace period keeps asking until the replacement is up.
+// Twenty refusals is well past the six attempts an earlier budget allowed.
+func TestRequestSuspendWaitsOutALongOutage(t *testing.T) {
+	gone := status.Error(codes.Unavailable, `connection error: desc = "transport: Error while dialing: dial unix /var/lib/ate/worker-support.sock: connect: no such file or directory"`)
+	atelet := &capturingAtelet{errs: slices.Repeat([]error{gone}, 20)}
 	conn := dialCapturingAtelet(t, atelet)
 
-	err := requestWithRetry(context.Background(), conn, Actor{Atespace: "team-a", Name: "actor-1", UID: "actor-uid-1"}, testBackoff())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := requestWithRetry(ctx, conn, Actor{Atespace: "team-a", Name: "actor-1", UID: "actor-uid-1"}, testBackoff()); err != nil {
+		t.Fatalf("requestWithRetry() failed: %v", err)
+	}
+	if got := len(atelet.requests()); got != 21 {
+		t.Errorf("asked %d times, want 21 (twenty refusals then the accepted one)", got)
+	}
+}
+
+// When the context ends while the control plane is still out of reach, the
+// error says what kept failing, not just that time passed.
+func TestRequestSuspendGivesUpAndSaysWhy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	unavailable := status.Error(codes.Unavailable, "atelet restarting")
+	atelet := &capturingAtelet{
+		errs: slices.Repeat([]error{unavailable}, manyRefusals),
+		// The context ends as the fifth refusal is sent, before a sixth
+		// attempt can be made.
+		onRequest: func(attempt int) {
+			if attempt == 4 {
+				cancel()
+			}
+		},
+	}
+	conn := dialCapturingAtelet(t, atelet)
+
+	err := requestWithRetry(ctx, conn, Actor{Atespace: "team-a", Name: "actor-1", UID: "actor-uid-1"}, testBackoff())
 	if err == nil {
 		t.Fatal("requestWithRetry() succeeded against an atelet that refused every attempt")
 	}
-	// What kept failing, not just that time passed.
 	if got := status.Code(err); got != codes.Unavailable {
 		t.Errorf("code = %v (err %v), want Unavailable", got, err)
 	}
-	if got := len(atelet.requests()); got != retrySteps {
-		t.Errorf("asked %d times, want %d", got, retrySteps)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to carry the context's end", err)
+	}
+	if got := len(atelet.requests()); got != 5 {
+		t.Errorf("asked %d times, want 5: the context ended the asking", got)
 	}
 }
 
 // The caller's context bounds the whole thing, retries included.
 func TestRequestSuspendStopsWhenTheContextEnds(t *testing.T) {
-	atelet := &capturingAtelet{errs: slices.Repeat([]error{status.Error(codes.Unavailable, "atelet restarting")}, retrySteps+1)}
+	atelet := &capturingAtelet{errs: slices.Repeat([]error{status.Error(codes.Unavailable, "atelet restarting")}, manyRefusals)}
 	conn := dialCapturingAtelet(t, atelet)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := requestWithRetry(ctx, conn, Actor{Atespace: "team-a", Name: "actor-1", UID: "actor-uid-1"}, testBackoff()); err == nil {
 		t.Fatal("requestWithRetry() with a dead context succeeded")
+	}
+	if got := len(atelet.requests()); got != 0 {
+		t.Errorf("asked %d times with a dead context, want 0", got)
 	}
 }
 

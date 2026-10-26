@@ -119,6 +119,10 @@ upstream ships its equivalent. The series is:
   `az://` snapshot locations) in `pkg/objectstorage` and `internal/objectstore`.
 - `ateworker-gvisor`: on `SIGTERM` the worker asks the control plane to
   suspend every actor it hosts (10 minute grace) before stopping them.
+- `internal/ateworker/suspend`: that suspend request keeps retrying for the
+  whole grace period while atelet is unreachable, instead of giving up after
+  six attempts (about 15 s). An atelet rolled off the node before its
+  replacement is up is gone for minutes, and giving up crashes the actor.
 - Agent-based PKI (`cmd/podcert-agent`, the podcertificate-controller's
   issuer API and trust-bundle publisher,
   `manifests/ate-install/components/agent-pki`) for clusters that do not
