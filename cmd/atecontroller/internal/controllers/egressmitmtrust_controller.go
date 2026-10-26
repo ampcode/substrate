@@ -155,6 +155,13 @@ const egressMITMSignerName = egressmitmtrust.SignerName
 
 const egressMITMTrustBundleName = egressmitmtrust.ClusterTrustBundleName
 
+// egressMITMSignerAnnotation records, on the ConfigMap sink, the signer whose
+// trust bundle it carries: the ConfigMap's counterpart to a
+// ClusterTrustBundle's spec.signerName. deleteTrustBundle refuses to delete a
+// ConfigMap that does not carry it. It is an annotation rather than a label
+// because a signer name contains a slash, which a label value may not.
+const egressMITMSignerAnnotation = "podcert.ate.dev/signer"
+
 // egressMITMTrustConfigMapRef locates the ConfigMap sink.
 func egressMITMTrustConfigMapRef() types.NamespacedName {
 	return types.NamespacedName{Namespace: egressmitmtrust.Namespace, Name: egressmitmtrust.ConfigMapName}
@@ -165,7 +172,9 @@ func buildEgressMITMTrustConfigMapApplyConfig(trustBundle string) *corev1ac.Conf
 	return corev1ac.ConfigMap(ref.Name, ref.Namespace).
 		WithLabels(map[string]string{
 			"podcert.ate.dev/canarying": "live",
-			"podcert.ate.dev/signer":    egressMITMSignerName,
+		}).
+		WithAnnotations(map[string]string{
+			egressMITMSignerAnnotation: egressMITMSignerName,
 		}).
 		WithData(map[string]string{egressmitmtrust.ConfigMapKey: trustBundle})
 }
@@ -222,8 +231,9 @@ func (r *EgressMITMTrustReconciler) deleteTrustBundle(ctx context.Context) error
 			}
 			return fmt.Errorf("failed to get ConfigMap %s: %w", ref, err)
 		}
-		if cm.Labels["podcert.ate.dev/signer"] != egressMITMSignerName {
-			return fmt.Errorf("refusing to delete ConfigMap %s: not labelled as the %s trust bundle", ref, egressMITMSignerName)
+		if signer := cm.Annotations[egressMITMSignerAnnotation]; signer != egressMITMSignerName {
+			return fmt.Errorf("refusing to delete ConfigMap %s: %s annotation is %q, not %q",
+				ref, egressMITMSignerAnnotation, signer, egressMITMSignerName)
 		}
 		if err := r.Delete(ctx, cm, client.Preconditions{UID: &cm.UID}); err != nil && !k8errors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete ConfigMap %s: %w", ref, err)

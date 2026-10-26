@@ -29,9 +29,12 @@ import (
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -411,6 +414,17 @@ func TestEgressMITMTrustConfigMapSink(t *testing.T) {
 	if cm.Labels["podcert.ate.dev/canarying"] != "live" {
 		t.Errorf("labels = %v, want the live canarying label", cm.Labels)
 	}
+	if got, want := cm.Annotations[egressMITMSignerAnnotation], egressMITMSignerName; got != want {
+		t.Errorf("%s annotation = %q, want %q", egressMITMSignerAnnotation, got, want)
+	}
+	// The fake client does not validate metadata; the API server does, and a
+	// signer name is not a valid label value.
+	if errs := metav1validation.ValidateLabels(cm.Labels, field.NewPath("metadata", "labels")); len(errs) > 0 {
+		t.Errorf("labels the API server would reject: %v", errs)
+	}
+	if errs := apivalidation.ValidateAnnotations(cm.Annotations, field.NewPath("metadata", "annotations")); len(errs) > 0 {
+		t.Errorf("annotations the API server would reject: %v", errs)
+	}
 	if _, ok := getTrustBundle(t, c); ok {
 		t.Error("a ClusterTrustBundle was created under the ConfigMap sink")
 	}
@@ -439,5 +453,46 @@ func TestEgressMITMTrustConfigMapSink(t *testing.T) {
 	}
 	if _, ok := getCM(); ok {
 		t.Error("the ConfigMap outlived its CA pool")
+	}
+}
+
+// A ConfigMap under the sink's name that does not record our signer was not
+// published by this controller, so the pool going away must not delete it.
+func TestEgressMITMTrustLeavesForeignConfigMapAlone(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+	}{
+		{name: "unannotated", annotations: nil},
+		{name: "other signer", annotations: map[string]string{egressMITMSignerAnnotation: "someone.else.example/identity"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ref := egressMITMTrustConfigMapRef()
+			foreign := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   ref.Namespace,
+					Name:        ref.Name,
+					Labels:      map[string]string{"podcert.ate.dev/canarying": "live"},
+					Annotations: tc.annotations,
+				},
+				Data: map[string]string{egressmitmtrust.ConfigMapKey: "not ours"},
+			}
+			c := fake.NewClientBuilder().WithScheme(egressMITMScheme(t)).WithObjects(foreign).Build()
+			r := &EgressMITMTrustReconciler{Client: c, SystemNamespace: installdefaults.SystemNamespace, Sink: EgressMITMTrustSinkConfigMap}
+
+			// No pool Secret exists, so this takes the delete path.
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: EgressMITMCAPoolRef(installdefaults.SystemNamespace)}); err == nil {
+				t.Fatal("Reconcile deleted a ConfigMap belonging to another signer")
+			}
+			cm := &corev1.ConfigMap{}
+			if err := c.Get(context.Background(), ref, cm); err != nil {
+				t.Fatalf("the foreign ConfigMap was deleted: %v", err)
+			}
+			if cm.Data[egressmitmtrust.ConfigMapKey] != "not ours" {
+				t.Errorf("the foreign ConfigMap was changed: %v", cm.Data)
+			}
+		})
 	}
 }
