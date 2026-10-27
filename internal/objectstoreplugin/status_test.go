@@ -54,6 +54,12 @@ func TestToStatusLogsUnrecognizedErrors(t *testing.T) {
 			[]string{`"level":"WARN"`, `"http_status":412`, `"error_type":"*objectstoreplugin.responseError"`}},
 		{"other error", fmt.Errorf("while reading gs://b/o?sig=%s: %w", secret, errors.New("boom")), codes.Internal,
 			[]string{`"level":"WARN"`, `"error_type":"*errors.errorString"`}},
+		{"service unavailable", fmt.Errorf("while writing gs://b/o?sig=%s: %w", secret, &responseError{503, "backend error for gs://b/o " + secret}), codes.Unavailable,
+			[]string{`"level":"INFO"`, `"http_status":503`, `"error_type":"*objectstoreplugin.responseError"`}},
+		{"throttled", fmt.Errorf("while writing: %w", &responseError{429, "slow down " + secret}), codes.Unavailable,
+			[]string{`"level":"INFO"`, `"http_status":429`}},
+		{"forbidden", fmt.Errorf("while writing: %w", &responseError{403, "denied " + secret}), codes.Internal,
+			[]string{`"level":"WARN"`, `"http_status":403`}},
 		{"not found", fmt.Errorf("while reading: %w", objectstorage.ErrObjectNotFound), codes.NotFound, nil},
 		{"canceled", context.Canceled, codes.Canceled, nil},
 	} {
@@ -75,7 +81,7 @@ func TestToStatusLogsUnrecognizedErrors(t *testing.T) {
 					t.Errorf("logs missing %s:\n%s", want, logs)
 				}
 			}
-			for _, leak := range []string{secret, "gs://b/o", "boom", "precondition failed"} {
+			for _, leak := range []string{secret, "gs://b/o", "boom", "precondition failed", "backend error", "slow down", "denied"} {
 				if strings.Contains(logs, leak) {
 					t.Errorf("logs carry %q:\n%s", leak, logs)
 				}

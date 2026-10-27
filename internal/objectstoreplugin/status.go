@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	"go.ate.dev/substrate/internal/objectstore"
 	"go.ate.dev/substrate/pkg/objectstorage"
@@ -39,10 +40,25 @@ func toStatus(err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, err.Error())
 	}
+	// A storage service that is throttling or failing over answers 408, 429 or
+	// 5xx. The backend client already retried those with a bounded backoff,
+	// so exhausting it means the outage outlasted the budget, not that the
+	// request is wrong. Unavailable lets atelet report the call as retryable
+	// and the control plane retry the operation instead of crashing the actor.
+	if desc, ok := objectstorage.DescribeServiceError(err); ok && isTransientHTTPStatus(desc.HTTPStatus) {
+		slog.Info("Object-store plugin hit a transient storage service error; returning Unavailable", internalErrorAttrs(err)...)
+		return status.Error(codes.Unavailable, err.Error())
+	}
 	// The caller sees only Internal, and atelet deliberately drops a plugin's
 	// status text, so this log line is the one record of why the plugin failed.
 	slog.Warn("Object-store plugin failed with an unrecognized error; returning Internal", internalErrorAttrs(err)...)
 	return status.Error(codes.Internal, err.Error())
+}
+
+// isTransientHTTPStatus reports whether a storage service response with this
+// status is worth retrying later: a timeout, throttling, or a server error.
+func isTransientHTTPStatus(httpStatus int) bool {
+	return httpStatus == http.StatusRequestTimeout || httpStatus == http.StatusTooManyRequests || httpStatus >= 500
 }
 
 // internalErrorAttrs describes err for the log without its text, which may
