@@ -86,8 +86,12 @@ spec:
       serviceAccountName: ate-api-server
       # Budget for the full shutdown sequence: --drain-delay (sized to cover
       # the readinessProbe below reaching NotReady, plus propagation) +
-      # --drain-timeout.
-      terminationGracePeriodSeconds: 40
+      # --drain-timeout (5m, atelet's). An in-flight SuspendActor drives
+      # atelet's Checkpoint, which streams a multi-GiB snapshot to the object
+      # store; force-stopping it mid-stream makes the client retry a Checkpoint
+      # whose workload is already gone. The sum must fit within
+      # terminationGracePeriodSeconds, plus slack for the force Stop().
+      terminationGracePeriodSeconds: 330
       # The control object-store plugin deletes and copies external snapshots
       # for ate-api-server, over a Unix socket in a pod-local emptyDir. A native
       # sidecar starts before ate-api-server and stops after it. ate-api-server
@@ -154,7 +158,7 @@ spec:
           - --default-egress-gateway-address=atenet-egress.ate-system.svc:443
           # Graceful shutdown knobs. The sum must fit within terminationGracePeriodSeconds.
           - --drain-delay=13s
-          - --drain-timeout=15s
+          - --drain-timeout=5m
           - --objectstore-plugin-socket=/run/objectstore-plugin/control.sock
         env:
         - name: POD_NAME
