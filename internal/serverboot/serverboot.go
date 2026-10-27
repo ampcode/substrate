@@ -427,12 +427,19 @@ func Fatal(ctx context.Context, msg string, err error, additionalArgs ...any) {
 	os.Exit(1)
 }
 
+// providerShutdownTimeout bounds one OTel provider's final flush at exit. A
+// collector that is unreachable while the process is already past "Shutdown
+// complete" must not hold the pod until the kubelet's grace period kills it.
+const providerShutdownTimeout = 15 * time.Second
+
 // ShutdownProvider invokes the OTel provider's Shutdown and logs any
 // error. Designed to be deferred from main():
 //
 //	defer serverboot.ShutdownProvider("TracerProvider", tp.Shutdown)
 func ShutdownProvider(name string, shutdown func(context.Context) error) {
-	if err := shutdown(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), providerShutdownTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
 		slog.Error("Failed to shutdown "+name, slog.Any("err", err))
 	}
 }
