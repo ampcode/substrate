@@ -832,7 +832,7 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		CpuMilli:              req.GetCpuMilli(),
 		MemoryBytes:           req.GetMemoryBytes(),
 	}); err != nil {
-		return nil, fmt.Errorf("while calling worker RunWorkload: %w", err)
+		return nil, workerCallError("RunWorkload", err)
 	}
 
 	return &ateletpb.RunResponse{}, nil
@@ -1008,7 +1008,7 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 		if err != nil {
 			// TODO: Worker should classify checkpoint failures, and set "should-crash"
 			// in the metadata if the error is not retriable.
-			return nil, fmt.Errorf("while calling worker CheckpointWorkload: %w", err)
+			return nil, workerCallError("CheckpointWorkload", err)
 		}
 		// The snapshot commits on this node once worker has written it, in either
 		// upload mode.
@@ -1664,8 +1664,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	})
 	dWorker = time.Since(tWorker)
 	if err != nil {
-		// TODO: classify the errors returned by Worker and crash the actor if needed.
-		return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
+		return nil, workerCallError("RestoreWorkload", err)
 	}
 
 	// Record the sandbox binaries actually running the guest on-node so a
@@ -1953,6 +1952,20 @@ func (s *Atelet) prepareOCIBundles(
 		return nil, err
 	}
 	return containerSpecs, nil
+}
+
+// workerCallError reports a failed call of the worker's rpc. A worker that
+// could not be reached, or that refused the call because it is draining,
+// reports codes.Unavailable: the sandbox was not started or saved, so the
+// control plane may retry and place the actor on another worker instead of
+// crashing it. The error keeps that code; apierror is what the interceptor
+// passes through, since a plain error reaches the control plane as Internal
+// and crashes the actor. Every other failure stays the plain error it was.
+func workerCallError(rpc string, err error) error {
+	if status.Code(err) == codes.Unavailable {
+		return apierror.Unavailable("while calling worker %s: %v", rpc, err)
+	}
+	return fmt.Errorf("while calling worker %s: %w", rpc, err)
 }
 
 // dialWorker opens (or reuses) the gRPC connection to the target worker

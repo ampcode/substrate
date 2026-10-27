@@ -303,7 +303,9 @@ func TestReconcileAssignments_ReleasesByActorState(t *testing.T) {
 		{name: "suspended unassigned is released", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, pointsAt: unassigned, wantState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, wantRelease: true},
 		{name: "running elsewhere is released", state: ateapipb.ActorState_ACTOR_STATE_RUNNING, pointsAt: otherWorker, wantState: ateapipb.ActorState_ACTOR_STATE_RUNNING, wantRelease: true},
 		{name: "suspended elsewhere is released", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, pointsAt: otherWorker, wantState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, wantRelease: true},
-		{name: "resuming crashes", state: ateapipb.ActorState_ACTOR_STATE_RESUMING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantRelease: true},
+		// Nothing of it ran on the restarted worker yet: back to SUSPENDED
+		// for another placement.
+		{name: "resuming returns to suspended", state: ateapipb.ActorState_ACTOR_STATE_RESUMING, wantState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, wantRelease: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

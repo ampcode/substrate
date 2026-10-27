@@ -196,7 +196,15 @@ func (w *WorkerWorkflow) releaseEarlierAssignment(ctx context.Context, worker *a
 	if actor.GetStatus().GetWorkerAssignment().GetWorkerEpoch() >= epoch {
 		return nil
 	}
-	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+	switch {
+	case actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+	case unplaceable(actor):
+		// The restart took the sandbox the resume was bringing up, not state
+		// the actor ran with: the next resume places it again.
+		if err := w.unplaceBoundActor(ctx, worker, actorRef, actor, crashMessageWorkerRestarted); err != nil {
+			return err
+		}
+	default:
 		if err := w.crashBoundActor(ctx, worker, actorRef, actor, "Releasing actor from a restarted worker", crashMessageWorkerRestarted); err != nil {
 			return err
 		}

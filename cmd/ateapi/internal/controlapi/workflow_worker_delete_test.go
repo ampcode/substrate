@@ -158,7 +158,9 @@ func TestDeleteWorkerWorkflow_ReleasedActorStateTransitions(t *testing.T) {
 		wantMetric bool
 	}{
 		{name: "running becomes crashed", start: ateapipb.ActorState_ACTOR_STATE_RUNNING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantOp: ateattr.OperationUnknown, wantMetric: true},
-		{name: "resuming becomes crashed", start: ateapipb.ActorState_ACTOR_STATE_RESUMING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantOp: ateattr.OperationResume, wantMetric: true},
+		// Nothing of a resuming Actor ran on the worker yet; it goes back to
+		// SUSPENDED for another placement instead of crashing.
+		{name: "resuming returns to suspended", start: ateapipb.ActorState_ACTOR_STATE_RESUMING, wantState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, wantMetric: false},
 		{name: "suspending becomes crashed", start: ateapipb.ActorState_ACTOR_STATE_SUSPENDING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantOp: ateattr.OperationSuspend, wantMetric: true},
 		{name: "reverting becomes crashed", start: ateapipb.ActorState_ACTOR_STATE_REVERTING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantOp: ateattr.OperationRevert, wantMetric: true},
 		{name: "deleting becomes crashed", start: ateapipb.ActorState_ACTOR_STATE_DELETING, wantState: ateapipb.ActorState_ACTOR_STATE_CRASHED, wantOp: ateattr.OperationDelete, wantMetric: true},
@@ -191,6 +193,14 @@ func TestDeleteWorkerWorkflow_ReleasedActorStateTransitions(t *testing.T) {
 			}
 			if tc.wantState == ateapipb.ActorState_ACTOR_STATE_CRASHED && got.GetStatus().GetWorkerAssignment() != nil {
 				t.Errorf("crashed actor worker assignment = %v, want it cleared", got.GetStatus().GetWorkerAssignment())
+			}
+			if tc.start == ateapipb.ActorState_ACTOR_STATE_RESUMING {
+				if got.GetStatus().GetWorkerAssignment() != nil {
+					t.Errorf("un-placed actor worker assignment = %v, want it cleared", got.GetStatus().GetWorkerAssignment())
+				}
+				if got.GetStatus().GetCrash() != nil {
+					t.Errorf("un-placed actor crash = %v, want none", got.GetStatus().GetCrash())
+				}
 			}
 			if tc.wantMetric {
 				assertCrashMetricDatapoint(t, reader, tc.wantOp, "ate-system", "tmpl", "pool-1", "gvisor", 1)

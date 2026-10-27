@@ -725,7 +725,8 @@ func TestResumeActor_CrashesOnMissingWorkerAssignment(t *testing.T) {
 // recovery path loads the worker by pod name only, so the assignment may have
 // been cleared and the worker re-claimed by another actor in the meantime. On
 // a mismatch the actor is crashed and the worker — which is not ours — must
-// not be written.
+// not be written. A worker that is gone or draining is reported lost for the
+// caller to replace, with nothing written yet.
 func TestValidateAssignedWorker(t *testing.T) {
 	ownAssignment := &ateapipb.ActorAssignment{
 		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "shared"},
@@ -751,8 +752,10 @@ func TestValidateAssignedWorker(t *testing.T) {
 		sandboxClass string
 		tmplSelector map[string]string
 		assignment   *ateapipb.ActorAssignment
-		// wantCode is codes.OK when validateAssignedWorker must return nil.
+		// wantCode is codes.OK when validateAssignedWorker must return nil
+		// or errAssignedWorkerLost (wantLost).
 		wantCode       codes.Code
+		wantLost       bool
 		wantActorState ateapipb.ActorState
 		// wantCrashMessage is the crash recorded when the actor is crashed.
 		wantCrashMessage string
@@ -763,20 +766,18 @@ func TestValidateAssignedWorker(t *testing.T) {
 		wantWorkerWrite bool
 	}{
 		{
-			name:             "crashes actor when worker is gone",
-			wantCode:         codes.Aborted,
-			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			wantCrashMessage: "resume failed: " + crashMessageWorkerGone,
+			name:           "reports worker lost and leaves actor untouched when worker is gone",
+			wantLost:       true,
+			wantActorState: ateapipb.ActorState_ACTOR_STATE_RESUMING,
 		},
 		{
-			name:             "crashes actor and leaves worker untouched when worker is draining",
-			workerStatus:     drainingStatus,
-			sandboxClass:     "gvisor",
-			assignment:       ownAssignment,
-			wantCode:         codes.Aborted,
-			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			wantCrashMessage: "resume failed: " + crashMessageWorkerDraining,
-			wantAssignment:   ownAssignment,
+			name:           "reports worker lost and leaves actor and worker untouched when worker is draining",
+			workerStatus:   drainingStatus,
+			sandboxClass:   "gvisor",
+			assignment:     ownAssignment,
+			wantLost:       true,
+			wantActorState: ateapipb.ActorState_ACTOR_STATE_RESUMING,
+			wantAssignment: ownAssignment,
 		},
 		{
 			name:           "leaves actor and worker untouched when worker is unavailable",
@@ -888,7 +889,10 @@ func TestValidateAssignedWorker(t *testing.T) {
 				tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: tt.tmplSelector}
 			}
 			_, err := w.validateAssignedWorker(ctx, resources.ActorRef{Atespace: "team-a", Name: "shared"}, resumingActor, tmpl)
-			if got := apierror.Code(err); got != tt.wantCode {
+			if errors.Is(err, errAssignedWorkerLost) != tt.wantLost {
+				t.Fatalf("errors.Is(err, errAssignedWorkerLost) = %v, want %v (err: %v)", !tt.wantLost, tt.wantLost, err)
+			}
+			if got := apierror.Code(err); !tt.wantLost && got != tt.wantCode {
 				t.Fatalf("apierror.Code(err) = %v, want %v (err: %v)", got, tt.wantCode, err)
 			}
 
@@ -2848,6 +2852,152 @@ func TestToAteletSandboxRuntime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if diff := cmp.Diff(tc.want, toAteletSandboxRuntime(tc.in), protocmp.Transform()); diff != "" {
 				t.Errorf("toAteletSandboxRuntime mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestEnsureWorkerAssigned_ReplacesLostWorker covers a RESUMING actor whose
+// worker went away before it came up there, as a worker pod deleted by a
+// rollout right after the scheduler picked it does. The resume takes the
+// actor off the lost worker and places it on a live one instead of crashing
+// it; an actor pinned to its node by a local snapshot that exists nowhere
+// else keeps the pin and waits for room on that node.
+func TestEnsureWorkerAssigned_ReplacesLostWorker(t *testing.T) {
+	activeStatus := func() *ateapipb.WorkerStatus {
+		return &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE, Capacity: &ateapipb.WorkerResources{Actors: 1}}
+	}
+	drainingStatus := func() *ateapipb.WorkerStatus {
+		return &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_DRAINING, Capacity: &ateapipb.WorkerResources{Actors: 1}}
+	}
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	tests := []struct {
+		name string
+		// lostStatus is the lost worker's stored status, nil for a worker
+		// whose record is gone.
+		lostStatus *ateapipb.WorkerStatus
+		// pinned seeds the paused shape: a local snapshot on node-1 whose
+		// durable copy is still PENDING.
+		pinned bool
+		// wantCode is the resume's outcome; OK means placed on pod-2.
+		wantCode codes.Code
+		// wantNode is the stored AssignedNode afterwards.
+		wantNode string
+	}{
+		{name: "moves to a live worker when its worker is gone", wantCode: codes.OK, wantNode: "node-2"},
+		{name: "moves to a live worker when its worker is draining", lostStatus: drainingStatus(), wantCode: codes.OK, wantNode: "node-2"},
+		{name: "keeps its node pin while its local snapshot is only on that node", lostStatus: drainingStatus(), pinned: true, wantCode: codes.ResourceExhausted, wantNode: "node-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := newTestPersistence(t)
+			if tt.lostStatus != nil {
+				if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
+					Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("pod-1")},
+					WorkerNamespace: "worker-ns",
+					WorkerPool:      "pool",
+					WorkerPod:       "pod-1",
+					WorkerPodUid:    testWorkerUID("pod-1"),
+					NodeName:        "node-1",
+					SandboxClass:    "gvisor",
+					Status:          tt.lostStatus,
+				}); err != nil {
+					t.Fatalf("CreateWorker: %v", err)
+				}
+			}
+			if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
+				Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("pod-2")},
+				WorkerNamespace: "worker-ns",
+				WorkerPool:      "pool",
+				WorkerPod:       "pod-2",
+				WorkerPodUid:    testWorkerUID("pod-2"),
+				NodeName:        "node-2",
+				SandboxClass:    "gvisor",
+				Status:          activeStatus(),
+			}); err != nil {
+				t.Fatalf("CreateWorker: %v", err)
+			}
+
+			opts := []func(*ateapipb.Actor){func(a *ateapipb.Actor) {
+				a.Status.AssignedNode = "node-1"
+				a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{
+					Worker:          &ateapipb.ObjectRef{Name: testWorkerUID("pod-1")},
+					WorkerNamespace: "worker-ns",
+					WorkerPool:      "pool",
+					WorkerPod:       "pod-1",
+					WorkerPodUid:    testWorkerUID("pod-1"),
+					NodeName:        "node-1",
+				}
+			}}
+			if tt.pinned {
+				opts = append(opts, withPausedShape(t, "node-1"))
+			}
+			seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_RESUMING, opts...)
+			actor, err := persistence.GetActor(ctx, actorRef)
+			if err != nil {
+				t.Fatalf("GetActor: %v", err)
+			}
+			actorUID := actor.GetMetadata().GetUid()
+			if tt.lostStatus != nil {
+				seedAssignment(t, persistence, testWorkerUID("pod-1"), &ateapipb.ActorAssignment{
+					Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"},
+					ActorUid: actorUID,
+				})
+			}
+			// withPausedShape's snapshot is seeded with the paused state's node
+			// pin; the lost worker's resume attempt pinned it the same way.
+			if tt.pinned {
+				actor.Status.AssignedNode = "node-1"
+			}
+
+			w := newSchedulingWorkflow(t, ctx, persistence)
+			assigned, worker, resumeErr := w.ensureWorkerAssigned(ctx, actorRef, actor, &ateapipb.ActorTemplate{})
+			if got := apierror.Code(resumeErr); got != tt.wantCode {
+				t.Fatalf("ensureWorkerAssigned() code = %v, want %v (err: %v)", got, tt.wantCode, resumeErr)
+			}
+			if resumeErr == nil {
+				if pod := worker.GetWorkerPod(); pod != "pod-2" {
+					t.Errorf("assigned worker pod = %q, want pod-2", pod)
+				}
+				if st := assigned.GetStatus().GetState(); st != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+					t.Errorf("returned actor state = %v, want RESUMING", st)
+				}
+			}
+
+			stored, err := persistence.GetActor(ctx, actorRef)
+			if err != nil {
+				t.Fatalf("GetActor: %v", err)
+			}
+			if stored.GetStatus().GetCrash() != nil {
+				t.Errorf("actor crashed: %v", stored.GetStatus().GetCrash())
+			}
+			if node := stored.GetStatus().GetAssignedNode(); node != tt.wantNode {
+				t.Errorf("stored AssignedNode = %q, want %q", node, tt.wantNode)
+			}
+			wantState := ateapipb.ActorState_ACTOR_STATE_RESUMING
+			if resumeErr != nil {
+				wantState = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+			}
+			if st := stored.GetStatus().GetState(); st != wantState {
+				t.Errorf("stored actor state = %v, want %v", st, wantState)
+			}
+			if resumeErr == nil {
+				if pod := stored.GetStatus().GetWorkerAssignment().GetWorkerPod(); pod != "pod-2" {
+					t.Errorf("stored assignment pod = %q, want pod-2", pod)
+				}
+				if got := firstAssignment(t, persistence, testWorkerUID("pod-2")); got.GetActorUid() != actorUID {
+					t.Errorf("pod-2 assignment = %v, want actor %s", got, actorUID)
+				}
+			} else if stored.GetStatus().GetWorkerAssignment() != nil {
+				t.Errorf("stored assignment = %v, want none", stored.GetStatus().GetWorkerAssignment())
+			}
+			if tt.lostStatus != nil {
+				if got := firstAssignment(t, persistence, testWorkerUID("pod-1")); got != nil {
+					t.Errorf("lost worker still holds assignment %v, want released", got)
+				}
 			}
 		})
 	}

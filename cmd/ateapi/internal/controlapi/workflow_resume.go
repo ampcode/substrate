@@ -232,8 +232,10 @@ func (w *ActorWorkflow) ensureVolumesCreated(ctx context.Context, actorRef resou
 //
 // A RESUMING actor was assigned by a previous attempt: its persisted
 // assignment is revalidated (worker still exists, not draining, still owned
-// by this actor UID, still eligible for the actor's constraints) and reused;
-// a stale assignment crashes the actor. A SUSPENDED actor goes through
+// by this actor UID, still eligible for the actor's constraints) and reused.
+// A worker that was deleted or is draining is replaced: the actor goes back
+// to SUSPENDED and through scheduling again, since it never ran there. Any
+// other stale assignment crashes the actor. A SUSPENDED actor goes through
 // scheduling (pinned to its assigned node when it holds a node-local
 // snapshot), claiming the worker and persisting RESUMING with the
 // assignment. A version conflict there is retried under a bounded backoff
@@ -243,17 +245,22 @@ func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resou
 	ctx, done := stepSpan(ctx, "AssignWorker")
 	defer func() { err = done(err) }()
 
-	switch actor.GetStatus().GetState() {
-	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
+	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING {
 		worker, err := w.validateAssignedWorker(ctx, actorRef, actor, actorTemplate)
-		if err != nil {
+		switch {
+		case err == nil:
+			markSkipped(ctx, "actor already RESUMING with a valid worker assignment")
+			return actor, worker, nil
+		case errors.Is(err, errAssignedWorkerLost):
+			if actor, err = w.replaceLostWorker(ctx, actorRef, actor, actorTemplate, err); err != nil {
+				return nil, nil, err
+			}
+		default:
 			return nil, nil, err
 		}
-		markSkipped(ctx, "actor already RESUMING with a valid worker assignment")
-		return actor, worker, nil
-	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
-	default:
-		return nil, nil, apierror.FailedPrecondition("AssignWorker prerequisite not met for Actor: %s (got: %v, want %s)", actorRef, actor.GetStatus().GetState(), ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	}
+	if st := actor.GetStatus().GetState(); st != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		return nil, nil, apierror.FailedPrecondition("AssignWorker prerequisite not met for Actor: %s (got: %v, want %s)", actorRef, st, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
 	}
 
 	var assignedActor *ateapipb.Actor
@@ -335,11 +342,30 @@ func (w *ActorWorkflow) recordExhaustedAssignment(ctx context.Context, elapsed t
 	w.instruments.recordSchedulerAssignment(ctx, elapsed, ateattr.SchedulerOutcomeError, "", "", snapshotSandboxClass(actor), err)
 }
 
+// replaceLostWorker takes a RESUMING actor off a worker that was deleted or
+// is draining (lost describes which) and returns it SUSPENDED, so the caller
+// schedules it again. The actor never reached RUNNING on that worker, so the
+// snapshot it was restoring from is still its latest state. Its volumes are
+// detached from the lost worker's node and its row on the worker released
+// first, so a failure in between leaves the actor RESUMING for a retry to
+// find.
+func (w *ActorWorkflow) replaceLostWorker(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, lost error) (*ateapipb.Actor, error) {
+	if err := w.ensureVolumesDetached(ctx, actor, actorTemplate, "DetachVolumesFromLostWorker", ateattr.OperationResume); err != nil {
+		return nil, err
+	}
+	if _, _, err := releaseWorker(ctx, w.store, actor); err != nil {
+		return nil, fmt.Errorf("while releasing lost worker: %w", err)
+	}
+	return unplaceActor(ctx, w.store, actorRef, actor, ateattr.OperationResume, lost.Error())
+}
+
 // validateAssignedWorker checks a RESUMING actor's persisted assignment
-// against the current worker record. Every invalid outcome crashes the actor:
-// a RESUMING actor whose worker vanished, drained, was reassigned, or is no
-// longer eligible can never make progress on its own. A worker that is only
-// unavailable is reported as UNAVAILABLE for the caller to retry.
+// against the current worker record. A worker that vanished or is draining
+// is reported as errAssignedWorkerLost for the caller to replace. Every other
+// invalid outcome crashes the actor: a RESUMING actor whose worker was
+// reassigned or is no longer eligible can never make progress on its own. A
+// worker that is only unavailable is reported as UNAVAILABLE for the caller
+// to retry.
 func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (*ateapipb.Worker, error) {
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	if assignment == nil {
@@ -354,23 +380,18 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 
 	worker, err := w.store.GetWorker(ctx, assignment.GetWorker().GetName())
 	if err != nil {
-		// Crash the actor if it was assigned to a deleted pod.
+		// The worker's pod is gone. Its sandbox, if the previous attempt got
+		// that far, went with it, and the actor never ran there.
 		if errors.Is(err, store.ErrNotFound) {
-			if cerr := crashActor(ctx, w.store, actorRef, ateattr.OperationResume, crashMessageWorkerGone); cerr != nil {
-				return nil, cerr
-			}
-			return nil, apierror.Aborted("actor %s crashed", actorRef)
+			return nil, fmt.Errorf("%w: worker %s no longer exists", errAssignedWorkerLost, assignment.GetWorkerPod())
 		}
 		return nil, fmt.Errorf("failed to get already assigned worker for actor %w", err)
 	}
+	// The worker is shutting down: its pod was deleted after the scheduler
+	// picked it (a draining worker is never picked) and the previous attempt
+	// did not bring the actor up on it in time.
 	if worker.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING {
-		slog.InfoContext(ctx, "Assigned worker is draining; crashing actor",
-			slog.String("actor", actorRef.String()),
-			slog.String("worker", worker.GetWorkerNamespace()+"/"+worker.GetWorkerPod()))
-		if cerr := crashActor(ctx, w.store, actorRef, ateattr.OperationResume, crashMessageWorkerDraining); cerr != nil {
-			return nil, cerr
-		}
-		return nil, apierror.Aborted("actor %s crashed", actorRef.String())
+		return nil, fmt.Errorf("%w: worker %s is draining", errAssignedWorkerLost, worker.GetWorkerNamespace()+"/"+worker.GetWorkerPod())
 	}
 	// An unavailable worker may come back with its Actors intact. If its worker
 	// restarted instead, the raised epoch has this Actor crashed for it.
@@ -940,6 +961,9 @@ func (w *ActorWorkflow) egressGateway() *ateletpb.EgressGateway {
 }
 
 // finalizeRunning re-reads the actor for a fresh version and commits RUNNING.
+// An actor that is no longer RESUMING was moved out from under the workflow
+// (its worker's deletion returned it to SUSPENDED, or it crashed) and keeps
+// that state: the sandbox the restore brought up is gone with the worker.
 func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizeRunning")
 	defer func() { err = done(err) }()
@@ -947,6 +971,9 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 	latestActor, err := w.store.GetActor(ctx, actorRef)
 	if err != nil {
 		return nil, err
+	}
+	if st := latestActor.GetStatus().GetState(); st != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		return nil, apierror.Aborted("actor %s is %s and no longer resuming, please retry", actorRef, st)
 	}
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {

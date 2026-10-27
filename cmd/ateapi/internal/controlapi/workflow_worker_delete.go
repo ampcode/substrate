@@ -193,7 +193,29 @@ func (w *WorkerWorkflow) releaseBoundActor(ctx context.Context, worker *ateapipb
 		markSkipped(ctx, "actor suspended cleanly before the pod went away")
 		return nil
 	}
+	// An actor still resuming never ran on the pod: its latest snapshot is
+	// intact, so it is returned to SUSPENDED for the next resume to place
+	// again instead of crashed.
+	if unplaceable(actor) {
+		return w.unplaceBoundActor(ctx, worker, actorRef, actor, crashMessageWorkerPodGone)
+	}
 	return w.crashBoundActor(ctx, worker, actorRef, actor, "Releasing actor from a worker whose pod is gone", crashMessageWorkerPodGone)
+}
+
+// unplaceBoundActor returns a RESUMING Actor that lost its Worker to
+// SUSPENDED with its pointers at the Worker cleared. The Actor's assignment
+// row in the worker is left for the caller to release.
+// A concurrent write to the Actor fails this as ABORTED.
+func (w *WorkerWorkflow) unplaceBoundActor(ctx context.Context, worker *ateapipb.Worker, actorRef resources.ActorRef, actor *ateapipb.Actor, reason string) error {
+	_, err := unplaceActor(ctx, w.store, actorRef, actor, ateattr.OperationResume, reason)
+	if errors.Is(err, store.ErrNotFound) {
+		// The actor was deleted out from under us; nothing points here anymore.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("while releasing resuming actor from worker %s: %w", worker.GetMetadata().GetName(), err)
+	}
+	return nil
 }
 
 // crashBoundActor moves an Actor that lost its sandbox on the Worker to
