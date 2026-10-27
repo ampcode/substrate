@@ -23,12 +23,15 @@ import (
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
 	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/installdefaults"
 	"go.ate.dev/substrate/internal/objectstore/objectstoretest"
 	"go.ate.dev/substrate/internal/objectstoreplugin/objectstoreplugintest"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestDeleteActorWorkflow_ExecutionPaths(t *testing.T) {
@@ -509,5 +512,41 @@ func TestDeleteActor_CollectsSnapshotsAfterWorkerDelete(t *testing.T) {
 				t.Errorf("deleting the actor left %v under its own prefix, want everything it wrote collected", left)
 			}
 		})
+	}
+}
+
+// A crashed actor keeps the node it ran on as a record. When that node has
+// left the cluster, deleting the actor has nothing to terminate there and must
+// not wait for an atelet that never comes back.
+func TestDeleteActor_SkipsTerminateOnGoneNode(t *testing.T) {
+	ctx := context.Background()
+	st, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+	w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+	seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_CRASHED, func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = "gone-node"
+	})
+
+	// The node is absent from the lister and no atelet is indexed on it.
+	noNodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	w.dialer = NewAteletDialer(newTestAteletIndexer(t), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+		WithNodeLister(corev1listers.NewNodeLister(noNodes)))
+
+	if _, err := w.DeleteActor(ctx, actorRef, false, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteActor on a gone node: %v", err)
+	}
+	if _, err := st.GetActor(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetActor after delete: err = %v, want ErrNotFound", err)
+	}
+
+	// Without a node lister the same delete keeps retrying, as before.
+	seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_CRASHED, func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = "gone-node"
+	})
+	w.dialer = newDanglingDialer()
+	if _, err := w.DeleteActor(ctx, actorRef, false, store.DeletePreconditions{}); !errors.Is(err, ErrNoAteletOnNode) {
+		t.Fatalf("DeleteActor without a node lister: err = %v, want ErrNoAteletOnNode", err)
 	}
 }

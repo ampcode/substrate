@@ -284,6 +284,9 @@ func main() {
 	ateletPodInformerFactory, ateletPodInformer := controlapi.AteletInformer(clientset, ateletNamespace)
 	scInformerFactory := informers.NewSharedInformerFactory(clientset, 0)
 	storageClassLister := scInformerFactory.Storage().V1().StorageClasses().Lister()
+	// Lets the atelet dialer tell a node the cluster lost from one whose
+	// atelet is restarting, so a delete does not wait forever on the former.
+	nodeLister := scInformerFactory.Core().V1().Nodes().Lister()
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -322,7 +325,7 @@ func main() {
 	}
 
 	volPlugins := make(map[string]volume.VolumePluginControlPlane)
-	ateletDialer := controlapi.NewAteletDialer(ateletPodInformer.GetIndexer(), ateletSPIFFEID, *ateletClientCredBundle, *podIdentityCACerts)
+	ateletDialer := controlapi.NewAteletDialer(ateletPodInformer.GetIndexer(), ateletSPIFFEID, *ateletClientCredBundle, *podIdentityCACerts, controlapi.WithNodeLister(nodeLister))
 
 	actorIDCAPool, err := localca.NewRefreshingPool(*actorIDCAPoolFile)
 	if err != nil {

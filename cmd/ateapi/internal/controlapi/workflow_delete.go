@@ -155,6 +155,16 @@ func (w *ActorWorkflow) ensureAteletTerminated(ctx context.Context, actorRef res
 
 	conn, err := w.dialer.DialForAteletOnNode(nodeName)
 	if err != nil {
+		// The node went away with everything the actor left on it: its
+		// workload, local snapshots and mounts. There is nothing to terminate,
+		// and retrying would hold the actor in DELETING for good (the reaper
+		// re-deletes a DELETING actor every pass).
+		if errors.Is(err, ErrNodeGone) {
+			slog.InfoContext(ctx, "node that hosted the actor no longer exists; skipping atelet terminate request",
+				slog.String("node", nodeName),
+				slog.Any("actor", actorRef))
+			return nil
+		}
 		return fmt.Errorf("while connecting to atelet on node %q: %w", nodeName, err)
 	}
 

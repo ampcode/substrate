@@ -35,6 +35,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/lru"
 )
@@ -43,6 +45,12 @@ import (
 // the requested node — e.g. the atelet is restarting, or the node is gone.
 // Retryable.
 var ErrNoAteletOnNode = errors.New("no atelet pod found on node")
+
+// ErrNodeGone reports that the requested node no longer exists in the
+// cluster, so no atelet will ever serve on it again: whatever an actor left
+// there is gone with the node. Not retryable. Reported only by a dialer built
+// WithNodeLister; without one a gone node reports ErrNoAteletOnNode.
+var ErrNodeGone = errors.New("node no longer exists")
 
 // ateletConn is a cached connection and the pod IP it was dialed on.
 type ateletConn struct {
@@ -53,6 +61,9 @@ type ateletConn struct {
 // AteletDialer handles gRPC connections to Atelet pods.
 type AteletDialer struct {
 	ateletIndexer cache.Indexer
+	// nodeLister, when set, tells a node that is gone (ErrNodeGone) from one
+	// whose atelet is merely absent (ErrNoAteletOnNode).
+	nodeLister corev1listers.NodeLister
 	// mu makes the lookup, stale eviction and insert in DialForAteletOnNode
 	// atomic, so concurrent callers cannot evict each other's fresh conn.
 	mu sync.Mutex
@@ -72,6 +83,12 @@ type DialerOption func(*AteletDialer)
 // while still exercising the real lookup, dial and connection-cache path.
 func WithDialCredentials(build func(expectedPodUID string) (credentials.TransportCredentials, error)) DialerOption {
 	return func(d *AteletDialer) { d.dialCredentials = build }
+}
+
+// WithNodeLister lets the dialer report ErrNodeGone for a node the cluster no
+// longer has, instead of ErrNoAteletOnNode.
+func WithNodeLister(nodes corev1listers.NodeLister) DialerOption {
+	return func(d *AteletDialer) { d.nodeLister = nodes }
 }
 
 // NewAteletDialer creates a new AteletDialer. clientBundlePath and serverCAPath
@@ -125,6 +142,11 @@ func (d *AteletDialer) DialForAteletOnNode(nodeName string) (*grpc.ClientConn, e
 	}
 
 	if len(matchingAtelets) == 0 {
+		if d.nodeLister != nil {
+			if _, err := d.nodeLister.Get(nodeName); apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("%w: %q", ErrNodeGone, nodeName)
+			}
+		}
 		return nil, fmt.Errorf("%w: %q", ErrNoAteletOnNode, nodeName)
 	}
 	if len(matchingAtelets) > 1 {

@@ -41,6 +41,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -327,6 +328,21 @@ func TestDialForAteletOnNode(t *testing.T) {
 		d := NewAteletDialer(newTestAteletIndexer(t), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "")
 		if _, err := d.DialForAteletOnNode("node1"); !errors.Is(err, ErrNoAteletOnNode) {
 			t.Fatalf("DialForAteletOnNode = %v, want ErrNoAteletOnNode", err)
+		}
+	})
+
+	t.Run("no atelet on a node the cluster lost", func(t *testing.T) {
+		nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		if err := nodes.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node2"}}); err != nil {
+			t.Fatalf("adding node to indexer: %v", err)
+		}
+		d := NewAteletDialer(newTestAteletIndexer(t), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+			WithNodeLister(corev1listers.NewNodeLister(nodes)))
+		if _, err := d.DialForAteletOnNode("node1"); !errors.Is(err, ErrNodeGone) {
+			t.Fatalf("DialForAteletOnNode(gone node) = %v, want ErrNodeGone", err)
+		}
+		if _, err := d.DialForAteletOnNode("node2"); !errors.Is(err, ErrNoAteletOnNode) {
+			t.Fatalf("DialForAteletOnNode(node without atelet) = %v, want ErrNoAteletOnNode", err)
 		}
 	})
 
