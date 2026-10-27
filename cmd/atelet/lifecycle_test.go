@@ -1267,51 +1267,107 @@ func TestImmediateCheckpointWithoutLocalCopy(t *testing.T) {
 // recorded as the actor's latest local snapshot, so the actor can still be
 // restored from it.
 func TestFailedCheckpointKeepsLocalSnapshot(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		snap string
-		mode ateletpb.UploadMode
-		fail func(t *testing.T, a *pluginActor)
-	}{
-		{
-			name: "suspend upload fails",
-			snap: "suspend-snap-2",
-			mode: ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE,
-			fail: func(t *testing.T, a *pluginActor) {
-				a.store.putErr = errors.New("object store unavailable")
-			},
-		},
-		{
-			name: "pause move fails",
-			snap: "pause-snap-2",
-			mode: ateletpb.UploadMode_UPLOAD_MODE_DEFERRED,
-			fail: func(t *testing.T, a *pluginActor) {
-				// A file where the new snapshot's directory belongs fails the move.
-				if err := os.WriteFile(ateletpath.LocalSnapshotDir(pluginActorUID, "pause-snap-2"), nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := runPluginActor(t)
-			if _, err := a.checkpoint(t, a.snapshot("pause-snap-1", 1), ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err != nil {
-				t.Fatalf("Checkpoint (pause): %v", err)
-			}
-			a.restoreLocal(t, "pause-snap-1", 1)
+	a := runPluginActor(t)
+	if _, err := a.checkpoint(t, a.snapshot("pause-snap-1", 1), ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err != nil {
+		t.Fatalf("Checkpoint (pause): %v", err)
+	}
+	a.restoreLocal(t, "pause-snap-1", 1)
 
-			tc.fail(t, a)
-			if _, err := a.checkpoint(t, a.snapshot(tc.snap, 2), tc.mode); err == nil {
-				t.Fatal("Checkpoint succeeded, want it to fail")
-			}
-			if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "pause-snap-1")); err != nil {
-				t.Errorf("pause snapshot after the failed checkpoint: stat = %v, want it kept", err)
-			}
-			if got := a.s.snapshots.State(pluginActorUID).GetLatestLocal().GetSnapshot().GetSnapshotUuid(); got != "pause-snap-1" {
-				t.Errorf("latest_local = %q, want pause-snap-1", got)
-			}
-			a.restoreLocal(t, "pause-snap-1", 1)
-		})
+	// A file where the new snapshot's directory belongs fails the move.
+	if err := os.WriteFile(ateletpath.LocalSnapshotDir(pluginActorUID, "pause-snap-2"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.checkpoint(t, a.snapshot("pause-snap-2", 2), ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err == nil {
+		t.Fatal("Checkpoint succeeded, want it to fail")
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "pause-snap-1")); err != nil {
+		t.Errorf("pause snapshot after the failed checkpoint: stat = %v, want it kept", err)
+	}
+	if got := a.s.snapshots.State(pluginActorUID).GetLatestLocal().GetSnapshot().GetSnapshotUuid(); got != "pause-snap-1" {
+		t.Errorf("latest_local = %q, want pause-snap-1", got)
+	}
+	a.restoreLocal(t, "pause-snap-1", 1)
+}
+
+// transientStoreError is a storage service failure that reports a transient
+// HTTP status, as a backend SDK's response error does once its retries are
+// exhausted.
+type transientStoreError struct{ code int }
+
+func (e *transientStoreError) Error() string {
+	return fmt.Sprintf("storage service answered %d", e.code)
+}
+func (e *transientStoreError) HTTPStatusCode() int { return e.code }
+
+// TestSuspendUploadFailureRetriesFromLocalCopy suspends a resumed actor while
+// the object store is failing over: the checkpoint reports the outage as
+// Unavailable, so the control plane retries rather than crashes the actor, and
+// keeps the snapshot worker wrote on the node, recorded as the actor's latest
+// local snapshot. The retried Checkpoint uploads that copy without driving
+// worker again (its workload is gone), and records it durable with the
+// checkpoint's commit time. A further retry reports the same state without
+// uploading again.
+func TestSuspendUploadFailureRetriesFromLocalCopy(t *testing.T) {
+	a := runPluginActor(t)
+	if _, err := a.checkpoint(t, a.snapshot("pause-snap-1", 1), ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err != nil {
+		t.Fatalf("Checkpoint (pause): %v", err)
+	}
+	a.restoreLocal(t, "pause-snap-1", 1)
+	snap := a.snapshot("suspend-snap-2", 2)
+
+	a.store.putErr = &transientStoreError{503}
+	_, err := a.checkpoint(t, snap, ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE)
+	if apierror.Code(err) != codes.Unavailable {
+		t.Fatalf("Checkpoint during the outage = %v, want %s", err, codes.Unavailable)
+	}
+	if a.worker.actorDirs["CheckpointWorkload"] == nil {
+		t.Fatal("worker.CheckpointWorkload not called by the first Checkpoint")
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "suspend-snap-2")); err != nil {
+		t.Errorf("snapshot after the failed upload: stat = %v, want it kept", err)
+	}
+	failed := a.s.snapshots.State(pluginActorUID)
+	if got := failed.GetLatestLocal(); !proto.Equal(got.GetSnapshot(), snap) || got.GetLocalCommitTime() == nil {
+		t.Errorf("latest_local after the failed upload = %v, want %v with its commit time", got, snap)
+	}
+	if failed.GetLatestDurable() != nil {
+		t.Errorf("latest_durable after the failed upload = %v, want unset", failed.GetLatestDurable())
+	}
+
+	a.store.putErr = nil
+	delete(a.worker.actorDirs, "CheckpointWorkload")
+	resp, err := a.checkpoint(t, snap, ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE)
+	if err != nil {
+		t.Fatalf("retried Checkpoint: %v", err)
+	}
+	if got := a.worker.actorDirs["CheckpointWorkload"]; got != nil {
+		t.Errorf("retried Checkpoint called worker.CheckpointWorkload (%v), want the local copy uploaded instead", got)
+	}
+	if !slices.Contains(a.store.keys(), manifestKey("suspend-snap-2")) {
+		t.Errorf("objects = %v, want the snapshot uploaded", a.store.keys())
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "suspend-snap-2")); err != nil {
+		t.Errorf("local snapshot after the retried checkpoint: stat = %v, want it kept", err)
+	}
+	st := resp.GetState()
+	commitTime := failed.GetLatestLocal().GetLocalCommitTime()
+	if got := st.GetLatestLocal(); !proto.Equal(got.GetSnapshot(), snap) || !proto.Equal(got.GetLocalCommitTime(), commitTime) {
+		t.Errorf("latest_local = %v, want %v committed at %v", got, snap, commitTime)
+	}
+	if got := st.GetLatestDurable(); !proto.Equal(got.GetSnapshot(), snap) || !proto.Equal(got.GetLocalCommitTime(), commitTime) || got.GetDurableCompleteTime() == nil {
+		t.Errorf("latest_durable = %v, want %v committed at %v, with its upload time", got, snap, commitTime)
+	}
+	if got := a.s.snapshots.State(pluginActorUID); !proto.Equal(got, st) {
+		t.Errorf("tracked state = %v, want %v, as Checkpoint returned", got, st)
+	}
+
+	a.store.putErr = errors.New("retried suspend should not upload again")
+	again, err := a.checkpoint(t, snap, ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE)
+	if err != nil {
+		t.Fatalf("Checkpoint retried after the upload: %v", err)
+	}
+	if got := again.GetState(); !proto.Equal(got, st) {
+		t.Errorf("state after a second retry = %v, want %v", got, st)
 	}
 }
 

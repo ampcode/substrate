@@ -215,6 +215,37 @@ func (t *Tracker) BeginCheckpoint(ctx context.Context, actorUID string, snap *at
 	return t.holdLocked(actorUID, a, &SnapshotRef{Snapshot: proto.CloneOf(snap)}, false), nil
 }
 
+// BeginUploadingCheckpoint is BeginCheckpoint for a Checkpoint under
+// UPLOAD_MODE_IMMEDIATE, which uploads snap itself: it also waits for a
+// background upload of snap in progress, and holds the actor's background
+// uploads off until the checkpoint ends, as BeginPromote does, so the same
+// snapshot is never uploaded twice at once.
+func (t *Tracker) BeginUploadingCheckpoint(ctx context.Context, actorUID string, snap *ateletpb.Snapshot) (end func(), err error) {
+	t.lock(actorUID)
+	defer t.unlock(actorUID)
+	a, err := t.waitForDetachOrSnapshotUploadLocked(ctx, actorUID, SnapshotRef{Snapshot: snap})
+	if err != nil {
+		return nil, err
+	}
+	return t.holdLocked(actorUID, a, &SnapshotRef{Snapshot: proto.CloneOf(snap)}, true), nil
+}
+
+// Committed reports whether snap is already recorded as the actor's latest
+// local snapshot, and whether as its latest durable one. A retried Checkpoint
+// of a snapshot an earlier attempt committed, whose response was lost or
+// whose upload failed, finds one or both set and must not drive worker again:
+// the workload is gone.
+func (t *Tracker) Committed(actorUID string, snap *ateletpb.Snapshot) (local, durable bool) {
+	t.lock(actorUID)
+	defer t.unlock(actorUID)
+	a := t.findLocked(actorUID)
+	if a == nil {
+		return false, false
+	}
+	ref := SnapshotRef{Snapshot: snap}
+	return sameUUID(a.LatestLocal, &ref), sameUUID(a.LatestDurable, &ref)
+}
+
 // BeginPromote records that a PromoteSnapshot of snap is in progress on this
 // node, once any detach in progress and any background upload of snap have
 // finished. It fails with FailedPrecondition when snap has a stale generation
