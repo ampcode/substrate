@@ -332,3 +332,7 @@ We provide several sample applications demonstrating Agent Substrate's capabilit
 * `cmd/benchmarking`: Synthetic workloads used by the load tests, including `glutton`, which consumes RAM, disk, and file descriptors on demand.
 * `tools/setup-gcp`: A provisioning utility to set up the necessary GCP infrastructure resources (GKE, GCS, IAM).
 * `demos/`: Sample applications demonstrating Agent Substrate capabilities.
+
+## Amp fork
+
+This is the Amp fork of Substrate. Amp pins the commit it deploys in `orb-provider/substrate/deploy/release/release.env` of the amp repository; every new commit here rebuilds the worker image and rolls a new worker generation on the next amp release.
