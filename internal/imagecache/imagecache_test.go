@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -321,6 +322,46 @@ func TestNew_RecoveryAndVersioning(t *testing.T) {
 	}
 	if _, err := New(root); err == nil {
 		t.Errorf("New accepted an unknown layout version")
+	}
+}
+
+// An older layout is rebuilt only when no actor has a bundle on the node.
+func TestNew_RebuildsOlderLayoutWithoutActors(t *testing.T) {
+	root := t.TempDir()
+	actors := t.TempDir()
+	layer := filepath.Join(root, "layers", "sha256", "deadbeef", "fs", "bin")
+	if err := os.MkdirAll(layer, 0o700); err != nil {
+		t.Fatalf("planting layer: %v", err)
+	}
+	// Unpacked layers keep the image's modes, which can be read-only.
+	if err := os.Chmod(filepath.Dir(layer), 0o500); err != nil {
+		t.Fatalf("making layer read-only: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, versionFileName), []byte("1\n"), 0o600); err != nil {
+		t.Fatalf("writing version marker: %v", err)
+	}
+	bundle := filepath.Join(actors, "actor-1", "bundles", "main")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		t.Fatalf("planting bundle: %v", err)
+	}
+	if _, err := New(root, WithActorsDir(actors)); err == nil {
+		t.Fatalf("New rebuilt a layout 1 pool while an actor bundle exists")
+	}
+	if _, err := os.Stat(layer); err != nil {
+		t.Fatalf("layer removed while an actor bundle exists: %v", err)
+	}
+
+	if err := os.RemoveAll(bundle); err != nil {
+		t.Fatalf("removing bundle: %v", err)
+	}
+	if _, err := New(root, WithActorsDir(actors)); err != nil {
+		t.Fatalf("New(rebuild): %v", err)
+	}
+	if _, err := os.Stat(layer); !os.IsNotExist(err) {
+		t.Errorf("layout 1 layer survived the rebuild: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, versionFileName)); err != nil || strings.TrimSpace(string(b)) != layoutVersion {
+		t.Errorf("version marker after rebuild = %q, %v; want %q", b, err, layoutVersion)
 	}
 }
 

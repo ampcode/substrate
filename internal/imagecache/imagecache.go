@@ -339,9 +339,23 @@ func New(root string, opts ...Option) (*Store, error) {
 	switch b, err := os.ReadFile(versionPath); {
 	case err == nil:
 		if got := strings.TrimSpace(string(b)); got != layoutVersion {
-			// Fail loudly instead of silently mixing layouts; an operator can
-			// delete the cache dir to rebuild it (it holds no unique state).
-			return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q, so delete it once no actor runs on this node", root, got, layoutVersion)
+			// The pool holds no unique state, so rebuild it, but only while no
+			// actor is placed on this node: a running actor's rootfs overlay
+			// reads the layer directories. Bundles exist exactly while an
+			// actor runs or transitions here (see InUse), so any bundle, or
+			// not knowing, keeps the pool and fails loudly instead of silently
+			// mixing layouts; an operator then deletes the cache dir.
+			placed, err := s.actorsPlaced()
+			if err != nil {
+				return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q: %w", root, got, layoutVersion, err)
+			}
+			if placed {
+				return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q, so delete it once no actor runs on this node", root, got, layoutVersion)
+			}
+			if err := s.reset(); err != nil {
+				return nil, fmt.Errorf("while rebuilding image cache at %q from layout version %q: %w", root, got, err)
+			}
+			slog.Warn("Rebuilt the image cache: its layout was from an older atelet and no actor is placed on this node", slog.String("root", root), slog.String("from", got), slog.String("to", layoutVersion))
 		}
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.WriteFile(versionPath, []byte(layoutVersion+"\n"), 0o600); err != nil {
@@ -383,6 +397,62 @@ func (s *Store) layerDir(diffID v1.Hash) string {
 
 func (s *Store) recordPath(digest v1.Hash) string {
 	return filepath.Join(s.root, "manifests", digest.Algorithm, digest.Hex+".json")
+}
+
+// actorsPlaced reports whether any actor has a bundle under the actors
+// directory, the same authority InUse pins layers by. Without an actors
+// directory, or when it cannot be read, it errs toward "placed".
+func (s *Store) actorsPlaced() (bool, error) {
+	if s.actorsDir == "" {
+		return true, errors.New("no actors directory to check for running actors")
+	}
+	actorEntries, err := os.ReadDir(s.actorsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("while listing actors dir %q: %w", s.actorsDir, err)
+	}
+	for _, actor := range actorEntries {
+		if !actor.IsDir() {
+			continue
+		}
+		bundles, err := os.ReadDir(filepath.Join(s.actorsDir, actor.Name(), "bundles"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return true, fmt.Errorf("while listing bundles of actor %q: %w", actor.Name(), err)
+		}
+		if len(bundles) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// reset empties the pool and marks it with the current layout version.
+func (s *Store) reset() error {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return fmt.Errorf("while listing %s: %w", s.root, err)
+	}
+	for _, e := range entries {
+		// RemoveAllWritable, not os.RemoveAll: unpacked image layers keep
+		// the image's directory modes, which can be read-only.
+		if err := RemoveAllWritable(filepath.Join(s.root, e.Name())); err != nil {
+			return fmt.Errorf("while removing %s: %w", filepath.Join(s.root, e.Name()), err)
+		}
+	}
+	for _, d := range []string{s.layersDir(), s.manifestsDir()} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return fmt.Errorf("while creating image cache dir %q: %w", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(s.root, versionFileName), []byte(layoutVersion+"\n"), 0o600); err != nil {
+		return fmt.Errorf("while writing image cache version marker: %w", err)
+	}
+	return nil
 }
 
 // sweepTempDirs removes unpack temp dirs, retired layer dirs, and
