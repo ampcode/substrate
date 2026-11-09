@@ -30,10 +30,10 @@ import (
 )
 
 var (
-	helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath string
-	v1alpha1Upgrade                                                    bool
-	v1alpha1UpgradeScaleDown                                           []string
-	v1alpha1UpgradeTimeout                                             time.Duration
+	helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath, sandboxConfigsPath string
+	v1alpha1Upgrade                                                                        bool
+	v1alpha1UpgradeScaleDown                                                               []string
+	v1alpha1UpgradeTimeout                                                                 time.Duration
 )
 
 // bootstrapCmd is the part of "deploy ate-system" that manifests cannot carry:
@@ -54,7 +54,10 @@ adopt them. With --crds the CRDs in that directory are applied too, which is
 how a chart upgrades them: Helm installs a chart's CRDs once and never changes
 them. --admission-policies applies the manifests in that directory right after
 the CRDs, so the resources applied next are checked by the current policies and
-not by the previous release's. --v1alpha1-upgrade stops an install from before
+not by the previous release's. --sandbox-configs applies the SandboxConfigs in
+that directory after the policies: a chart cannot carry them itself, since Helm
+rejects a release whose custom resources name an API version the cluster does
+not serve yet, as across a CRD version change. --v1alpha1-upgrade stops an install from before
 1.0 first (scales down the Deployments named by --v1alpha1-upgrade-scale-down,
 deletes its WorkerPools so every running sandbox is suspended, stops its
 control plane, and deletes its v1alpha1 CRDs) and does nothing on a cluster
@@ -113,6 +116,13 @@ that is not one.`,
 				return err
 			}
 		}
+		// After the CRDs and the policies that check them.
+		if sandboxConfigsPath != "" {
+			log.Step("apply_sandbox_configs")
+			if err := env.Kube.ApplyPath(ctx, sandboxConfigsPath); err != nil {
+				return err
+			}
+		}
 		// The podcertificate controller mounts every signer pool, so the
 		// pools have to exist before its Deployment is applied.
 		if err := env.EnsurePodCertificateCAs(ctx); err != nil {
@@ -152,6 +162,7 @@ func init() {
 	f.StringVar(&helmReleaseNamespace, "helm-release-namespace", "", "Namespace of that Helm release")
 	f.StringVar(&crdsPath, "crds", "", "Directory of CRD manifests to apply before anything else (none by default)")
 	f.StringVar(&admissionPoliciesPath, "admission-policies", "", "Directory of admission policy manifests to apply after the CRDs (none by default)")
+	f.StringVar(&sandboxConfigsPath, "sandbox-configs", "", "Directory of SandboxConfig manifests to apply after the admission policies (none by default)")
 	f.BoolVar(&v1alpha1Upgrade, "v1alpha1-upgrade", false, "Stop a pre-1.0 install (v1alpha1 CRDs) before applying the CRDs; no-op on any other cluster")
 	f.StringSliceVar(&v1alpha1UpgradeScaleDown, "v1alpha1-upgrade-scale-down", nil, "Deployments (namespace/name) to scale to zero before the pre-1.0 worker pools are deleted")
 	f.DurationVar(&v1alpha1UpgradeTimeout, "v1alpha1-upgrade-timeout", time.Hour, "How long to wait for each step of the pre-1.0 upgrade: the scale-downs, the worker pods suspending their sandboxes, and the CRD deletion")
