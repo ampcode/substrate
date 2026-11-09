@@ -368,6 +368,9 @@ func TestRequireTransferServiceAccount(t *testing.T) {
 		{name: "GKE without a project", cfg: Config{TransferGSAName: "xfer"}, wantKey: "gcp.projectID"},
 		{name: "GKE with both", cfg: Config{TransferGSAName: "xfer", ProjectID: "proj"}},
 		{name: "kind without either", cfg: Config{Kind: true}},
+		{name: "gcs backend without a name", cfg: Config{StorageBackend: StorageBackendGCS, ProjectID: "proj"}, wantKey: "storage.transferGSAName"},
+		{name: "s3 backend without either", cfg: Config{StorageBackend: StorageBackendS3}},
+		{name: "azblob backend without either", cfg: Config{StorageBackend: StorageBackendAzureBlob}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.cfg.RequireTransferServiceAccount()

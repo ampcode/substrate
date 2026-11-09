@@ -236,6 +236,7 @@ func buildConfig(root string, env map[string]string, r *Resolved) (*Config, erro
 
 		BucketName:         r.String("storage.bucketName"),
 		SnapshotLocation:   r.String("storage.snapshotLocation"),
+		StorageBackend:     r.String("storage.backend"),
 		TransferGSAName:    r.String("storage.transferGSAName"),
 		KODockerRepo:       r.String("ko.dockerRepo"),
 		KODefaultPlatforms: r.String("ko.defaultPlatforms"),
@@ -400,6 +401,14 @@ func validateResolved(cfg *Config, r *Resolved) error {
 	case RouterEnvoy, RouterAgentgateway:
 	default:
 		return &InvalidError{Value: dataplane, Want: RouterEnvoy + " or " + RouterAgentgateway}
+	}
+
+	backend, _ := r.Value("storage.backend")
+	switch cfg.StorageBackend {
+	case StorageBackendGCS, StorageBackendS3, StorageBackendAzureBlob:
+	default:
+		return &InvalidError{Value: backend, Want: strings.Join(
+			[]string{StorageBackendGCS, StorageBackendS3, StorageBackendAzureBlob}, ", ")}
 	}
 
 	if ipType, _ := r.Value("ateapi.postgres.cloudsql.ipType"); ipType.Raw != "" {

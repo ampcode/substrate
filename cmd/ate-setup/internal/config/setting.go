@@ -154,6 +154,11 @@ var Registry = []Setting{
 		Usage: "Cluster-wide object-storage URI ate-api-server stores snapshots under, for example gs://BUCKET/PREFIX/ (required if the PerTemplateSnapshotLocation preview gate is not enabled)",
 	},
 	{
+		Key: "storage.backend", Env: "ATE_STORAGE_BACKEND", Flag: "storage-backend", Kind: KindString,
+		Default: StorageBackendGCS,
+		Usage:   "Object-storage backend the installed manifests select (ATE_STORAGE_BACKEND): gcs, s3, or azblob. Only gcs needs --snapshot-transfer-gsa-name",
+	},
+	{
 		Key: "storage.transferGSAName", Env: "SNAPSHOT_TRANSFER_GSA_NAME", Flag: "snapshot-transfer-gsa-name", Kind: KindString,
 		Usage: "Name of the Google service account snapshot transfers run as on GCS, in gcp.projectID. ate-api-server's credential exchange impersonates it (required to deploy ate-api-server on GKE, unused on kind)",
 	},

@@ -328,6 +328,7 @@ demos, the [benchmarks](benchmarking.md#settings), and the
 | `sandboxClasses`                             | `ATE_INSTALL_SANDBOX_CLASSES`                   | `--sandbox-classes`                                | `gvisor,microvm`      | `deploy ate-system`, `deploy sandboxconfig` |
 | `storage.bucketName`                         | `BUCKET_NAME`                                   | `--storage-bucket-name`                            | —                     | (global)                                 |
 | `storage.snapshotLocation`                   | `SNAPSHOT_LOCATION`                             | `--snapshot-location`                              | —                     | (global)                                 |
+| `storage.backend`                            | `ATE_STORAGE_BACKEND`                           | `--storage-backend`                                | `gcs`                 | (global)                                 |
 | `storage.transferGSAName`                    | `SNAPSHOT_TRANSFER_GSA_NAME`                    | `--snapshot-transfer-gsa-name`                     | —                     | (global)                                 |
 
 ## Snapshot storage

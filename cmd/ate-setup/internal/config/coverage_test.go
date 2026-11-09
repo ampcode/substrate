@@ -94,6 +94,8 @@ func valueFor(key string) string {
 		return "spiffe://cluster.local/ns/a/sa/b"
 	case "ateapi.postgres.cloudsql.ipType":
 		return CloudSQLIPTypePSC
+	case "storage.backend":
+		return StorageBackendS3
 	case "atenet.egress.additionalExtprocService":
 		return "ns/svc:8080"
 	case "atenet.egress.credentialProvider":

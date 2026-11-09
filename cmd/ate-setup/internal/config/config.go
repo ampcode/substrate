@@ -43,6 +43,13 @@ const (
 	RouterEnvoy        = "envoy"
 	RouterAgentgateway = "agentgateway"
 
+	// Object-storage backends, the values of ATE_STORAGE_BACKEND that
+	// pkg/objectstorage reads in ate-api-server, atelet, and the
+	// objectstore-plugin sidecar.
+	StorageBackendGCS       = "gcs"
+	StorageBackendS3        = "s3"
+	StorageBackendAzureBlob = "azblob"
+
 	SandboxClassGvisor  = "gvisor"
 	SandboxClassMicrovm = "microvm"
 
@@ -147,6 +154,11 @@ type Config struct {
 	// benchmarks, and so e2e runs, need it even with the gate, since they do
 	// not set storageLocation.
 	SnapshotLocation string
+
+	// StorageBackend is the object store the rendered manifests select with
+	// ATE_STORAGE_BACKEND (ATE_STORAGE_BACKEND): gcs, s3, or azblob. It decides
+	// whether RequireTransferServiceAccount applies.
+	StorageBackend string
 
 	// TransferGSAName is the name of the Google service account snapshot
 	// transfers run as on GCS, in ProjectID (SNAPSHOT_TRANSFER_GSA_NAME).
@@ -304,9 +316,10 @@ func (c *Config) TransferServiceAccount() string {
 // RequireTransferServiceAccount fails when the install would deploy
 // ate-api-server on GCS without a transfer service account. Its credential
 // exchange impersonates the account and refuses to start without one.
-// ate-setup installs GCS everywhere but kind, which uses S3.
+// ate-setup installs GCS by default; kind uses S3, and an install whose
+// manifests select S3 or Azure Blob says so with --storage-backend.
 func (c *Config) RequireTransferServiceAccount() error {
-	if c.Kind {
+	if c.Kind || (c.StorageBackend != "" && c.StorageBackend != StorageBackendGCS) {
 		return nil
 	}
 	if c.TransferGSAName == "" {
