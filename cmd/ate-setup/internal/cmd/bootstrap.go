@@ -61,7 +61,9 @@ not serve yet, as across a CRD version change. --v1alpha1-upgrade stops an insta
 1.0 first (scales down the Deployments named by --v1alpha1-upgrade-scale-down,
 deletes its WorkerPools so every running sandbox is suspended, stops its
 control plane, and deletes its v1alpha1 CRDs) and does nothing on a cluster
-that is not one.`,
+that is not one; with --helm-release it also drops the v1alpha1 objects from the
+manifests Helm stored for the release, which Helm maps against the cluster before
+every later upgrade, rollback or uninstall.`,
 	Args: cobra.NoArgs,
 	// Replaces the root hook: that one needs a repository checkout for
 	// .ate-dev-env.sh and the manifests, and fetches GKE credentials, none of
@@ -97,6 +99,16 @@ that is not one.`,
 				Timeout:   v1alpha1UpgradeTimeout,
 			}); err != nil {
 				return err
+			}
+			// Helm mapped the deployed release's manifest before this hook
+			// ran, so this upgrade is fine; the retry of a failed one, the
+			// next upgrade, a rollback and an uninstall map it again and
+			// would stop at the v1alpha1 objects the old chart rendered
+			// (steps/helmrelease.go).
+			if helmRelease != "" {
+				if err := env.StripV1alpha1FromHelmRelease(ctx, helmReleaseNamespace, helmRelease); err != nil {
+					return err
+				}
 			}
 		}
 		// Before the controllers that serve the new schema roll, so a
