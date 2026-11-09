@@ -1817,14 +1817,14 @@ func TestValidateContainer(t *testing.T) {
 			want: field.ErrorList{field.NotSupported[string](capsPath.Child("drop").Index(0), nil, nil)},
 		}, {
 			name: "capabilities: add outside the allowlist rejected",
-			obj:  caps([]string{"MKNOD", "SYS_ADMIN"}, nil),
+			obj:  caps([]string{"SYS_PTRACE", "SYS_RAWIO"}, nil),
 			want: field.ErrorList{
 				field.NotSupported[string](capsPath.Child("add").Index(0), nil, nil),
 				field.NotSupported[string](capsPath.Child("add").Index(1), nil, nil),
 			},
 		}, {
 			name: "capabilities: drop outside the allowlist accepted",
-			obj:  caps(nil, []string{"MKNOD", "SYS_ADMIN"}),
+			obj:  caps(nil, []string{"SYS_PTRACE", "SYS_RAWIO"}),
 		}, {
 			name: "capabilities: duplicate rejected by the set",
 			obj:  caps([]string{"SETUID", "SETUID"}, nil),

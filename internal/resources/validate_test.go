@@ -573,8 +573,9 @@ func TestValidateCapabilities(t *testing.T) {
 		wantErrs int
 	}{
 		{"valid names", []string{"NET_BIND_SERVICE", "SYS_CHROOT"}, false, 0},
-		{"add outside the allowlist", []string{"MKNOD", "SYS_ADMIN", "NET_RAW", "SYS_PTRACE", "DAC_READ_SEARCH"}, false, 5},
-		{"drop outside the allowlist", []string{"MKNOD", "SYS_ADMIN"}, true, 0},
+		{"add outside the allowlist", []string{"SYS_PTRACE", "DAC_READ_SEARCH", "SYS_RAWIO"}, false, 3},
+		{"add what the fork's sandboxes need for dockerd", []string{"MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN"}, false, 0},
+		{"drop outside the allowlist", []string{"SYS_PTRACE", "SYS_RAWIO"}, true, 0},
 		{"CAP_ prefix in drop", []string{"CAP_NET_ADMIN"}, true, 1},
 		{"every allowed name in add", sets.List(AllowedAddCapabilities), false, 0},
 		{"ALL rejected for add", []string{"ALL"}, false, 1},

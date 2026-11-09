@@ -715,7 +715,7 @@ func TestValidateActorTemplate(t *testing.T) {
 	}, {
 		name: "capability outside the add allowlist",
 		mutate: func(tmpl *ateapi.ActorTemplate) {
-			tmpl.Containers[0].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: []string{"MKNOD"}}}
+			tmpl.Containers[0].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: []string{"SYS_PTRACE"}}}
 		},
 		want: field.ErrorList{field.NotSupported[string](field.NewPath("containers").Index(0).Child("security_context", "capabilities", "add").Index(0), nil, nil)},
 	}, {

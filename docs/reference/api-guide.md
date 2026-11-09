@@ -372,7 +372,7 @@ A container running as root has that set as its effective capabilities. A contai
       add: ["NET_BIND_SERVICE"]
   ```
 
-- **Allowed capabilities.** `add` accepts only `AUDIT_WRITE`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` and `SYS_CHROOT`. Any other name, including `ALL`, `DAC_READ_SEARCH`, `MKNOD`, `NET_RAW`, `SYS_ADMIN` and `SYS_PTRACE`, is rejected at admission. These capabilities act on the microVM guest kernel and its devices, not just on the container. `drop` accepts any capability name.
+- **Allowed capabilities.** `add` accepts only `AUDIT_WRITE`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `MKNOD`, `NET_ADMIN`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID`, `SYS_ADMIN` and `SYS_CHROOT` (this fork runs gVisor sandboxes only and adds the last four for dockerd inside them; upstream rejects them because of the microVM runtime). Any other name, including `ALL`, `DAC_READ_SEARCH` and `SYS_PTRACE`, is rejected at admission. These capabilities act on the microVM guest kernel and its devices, not just on the container. `drop` accepts any capability name.
 - **Ambient capabilities are not supported** ([gvisor#3166](https://github.com/google/gvisor/issues/3166)).
 - **Low ports.** A container may bind a port below 1024 without `NET_BIND_SERVICE` on both runtimes: gVisor's network stack has no privileged-port limit, and the microVM guest sets `net.ipv4.ip_unprivileged_port_start=0` to match.
 - **`ping` without `NET_RAW`.** `NET_RAW` can't be added. Both runtimes let any user open ICMP echo sockets, which is what `ping` uses: gVisor's network stack allows them, and the microVM guest sets `net.ipv4.ping_group_range=0 2147483647` to match.

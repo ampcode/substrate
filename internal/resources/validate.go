@@ -423,9 +423,17 @@ var linuxCapabilities = sets.New(
 )
 
 // AllowedAddCapabilities are the capabilities a container may add.
+//
+// Fork: upstream stops at SYS_CHROOT because MKNOD, NET_ADMIN, NET_RAW and
+// SYS_ADMIN act on a microVM's guest kernel and devices. This fork runs only
+// gVisor sandboxes, where the sentry holds none of them on the node, and its
+// sandboxes run dockerd, which needs NET_ADMIN for its bridge and SNAT,
+// SYS_ADMIN for its cgroup and container mounts, and Docker's default set,
+// which has MKNOD and NET_RAW. Every actor template already stored names them.
 var AllowedAddCapabilities = sets.New(
 	"AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
-	"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	"MKNOD", "NET_ADMIN", "NET_BIND_SERVICE", "NET_RAW", "SETFCAP", "SETGID",
+	"SETPCAP", "SETUID", "SYS_ADMIN", "SYS_CHROOT",
 )
 
 // ValidateAddCapabilities accepts only AllowedAddCapabilities.
