@@ -78,7 +78,11 @@ func (e *Env) StripV1alpha1FromHelmRelease(ctx context.Context, namespace, name 
 		}
 		rewritten, removed, err := stripV1alpha1FromHelmRelease(encoded)
 		if err != nil {
-			return fmt.Errorf("while reading Helm release version %s: %w", secret.Name, err)
+			// Helm skips a stored version it cannot decode when it reads the
+			// release's history, so such a version cannot stop an upgrade
+			// either and is left alone.
+			log.Warnf("skipping Helm release version %s, which Helm cannot read either: %v", secret.Name, err)
+			continue
 		}
 		if removed == 0 {
 			continue

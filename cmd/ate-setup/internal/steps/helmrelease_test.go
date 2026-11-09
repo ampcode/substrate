@@ -111,9 +111,13 @@ func TestStripV1alpha1FromHelmRelease(t *testing.T) {
 	deployed := helmReleaseSecret(t, "orb-provider", 7, "deployed", preV1ReleaseManifest)
 	failed := helmReleaseSecret(t, "orb-provider", 8, "failed", "---\n# Source: x\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: amp-orb-provider\n")
 	other := helmReleaseSecret(t, "something-else", 1, "deployed", preV1ReleaseManifest)
+	// A version Helm cannot read either (here, gzipped nothing) is skipped, as Helm does.
+	unreadable := helmReleaseSecret(t, "orb-provider", 6, "superseded", preV1ReleaseManifest)
+	unreadable.Data[helmReleaseDataKey] = mustEncodeHelmRelease(t, nil)
 	failedBefore := failed.Data[helmReleaseDataKey]
 	otherBefore := other.Data[helmReleaseDataKey]
-	cs := fake.NewClientset(deployed, failed, other)
+	unreadableBefore := unreadable.Data[helmReleaseDataKey]
+	cs := fake.NewClientset(deployed, failed, other, unreadable)
 	env := &Env{Kube: kube.NewFromClients(nil, cs, nil, cs.Discovery())}
 
 	if err := env.StripV1alpha1FromHelmRelease(ctx, "amp-orbs", "orb-provider"); err != nil {
@@ -156,6 +160,13 @@ func TestStripV1alpha1FromHelmRelease(t *testing.T) {
 	}
 	if string(got.Data[helmReleaseDataKey]) != string(otherBefore) {
 		t.Error("another release was rewritten")
+	}
+	got, err = cs.CoreV1().Secrets("amp-orbs").Get(ctx, unreadable.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data[helmReleaseDataKey]) != string(unreadableBefore) {
+		t.Error("an unreadable version was rewritten")
 	}
 
 	// Running again finds nothing to do.
@@ -206,4 +217,13 @@ func TestStripV1alpha1Documents(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustEncodeHelmRelease(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	encoded, err := encodeHelmRelease(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
