@@ -29,17 +29,19 @@ import (
 )
 
 func TestNewExchangeService(t *testing.T) {
-	t.Run("S3 answers unimplemented", func(t *testing.T) {
-		t.Setenv("ATE_STORAGE_BACKEND", "s3")
-		svc, release, err := newExchangeService(t.Context(), exchangeConfig{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer release()
-		if _, ok := svc.(exchangepb.UnimplementedCredentialExchangeServer); !ok {
-			t.Fatalf("S3 exchange is %T, want the unimplemented server", svc)
-		}
-	})
+	for _, backend := range []string{"s3", "azblob"} {
+		t.Run(backend+" answers unimplemented", func(t *testing.T) {
+			t.Setenv("ATE_STORAGE_BACKEND", backend)
+			svc, release, err := newExchangeService(t.Context(), exchangeConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			if _, ok := svc.(exchangepb.UnimplementedCredentialExchangeServer); !ok {
+				t.Fatalf("%s exchange is %T, want the unimplemented server", backend, svc)
+			}
+		})
+	}
 	const (
 		issuer = "https://idp.ate-system.svc"
 		xfer   = "xfer@proj.iam.gserviceaccount.com"

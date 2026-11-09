@@ -54,9 +54,9 @@ type exchangeConfig struct {
 // exchange. S3 answers UNIMPLEMENTED, since the S3 node plugin never calls
 // it: it ignores actor_jwt and transfers with the pod's own credentials. The
 // backend seam is exchange.Issuer, the one piece of the exchange that is not
-// shared between backends.
+// shared between backends. Azure Blob answers UNIMPLEMENTED like S3.
 func newExchangeService(ctx context.Context, cfg exchangeConfig) (exchangepb.CredentialExchangeServer, func(), error) {
-	if objectstorage.UsesS3() {
+	if objectstorage.UsesAmbientCredentials() {
 		return exchangepb.UnimplementedCredentialExchangeServer{}, func() {}, nil
 	}
 	if cfg.issuer == "" {

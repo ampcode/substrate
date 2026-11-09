@@ -130,9 +130,10 @@ func main() {
 			serverboot.Fatal(ctx, "Invalid --upload-memory-budget", err)
 		}
 		// On GCS every transfer runs on a token scoped to its actor, from the
-		// exchange. S3 has no per-actor credential and keeps the pod's own.
+		// exchange. S3 and Azure Blob have no per-actor credential and keep
+		// the pod's own.
 		var nodeOpts []objectstoreplugin.NodeOption
-		if !objectstorage.UsesS3() {
+		if !objectstorage.UsesAmbientCredentials() {
 			creds, err := exchangeclient.New(ncfg)
 			if err != nil {
 				serverboot.Fatal(ctx, "Failed to set up the credential exchange client", err)

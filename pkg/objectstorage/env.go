@@ -36,6 +36,14 @@ func UsesAzureBlob() bool {
 	return os.Getenv("ATE_STORAGE_BACKEND") == "azblob"
 }
 
+// UsesAmbientCredentials reports whether snapshot transfers run on the pod's
+// own credentials. Only GCS has the per-actor credential exchange; S3 and
+// Azure Blob authenticate with the identity the cloud projects into the pod
+// (IRSA, workload identity).
+func UsesAmbientCredentials() bool {
+	return UsesS3() || UsesAzureBlob()
+}
+
 // NewS3ClientFromEnv builds an S3 client from the standard AWS environment
 // variables. AWS_S3_USE_PATH_STYLE=true selects path-style addressing.
 func NewS3ClientFromEnv(ctx context.Context) (*s3.Client, error) {
