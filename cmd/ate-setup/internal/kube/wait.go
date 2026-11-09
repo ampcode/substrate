@@ -340,3 +340,67 @@ func (c *Client) RolloutRestart(ctx context.Context, namespace, name string, now
 	}
 	return nil
 }
+
+// ScaleDeploymentToZero sets a Deployment's replicas to zero and waits until
+// it has no pods left. A missing Deployment needs nothing.
+func (c *Client) ScaleDeploymentToZero(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	dep, err := c.GetDeployment(ctx, namespace, name)
+	if err != nil {
+		return err
+	}
+	if dep == nil {
+		return nil
+	}
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 0 {
+		if err := c.PatchDeployment(ctx, namespace, name, []byte(`{"spec":{"replicas":0}}`)); err != nil {
+			return err
+		}
+	}
+	err = poll(ctx, timeout, func(ctx context.Context) (bool, error) {
+		dep, err := c.GetDeployment(ctx, namespace, name)
+		if err != nil {
+			return false, err
+		}
+		return dep == nil || (dep.Status.Replicas == 0 && dep.Status.ObservedGeneration >= dep.Generation), nil
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for deployment %s/%s to scale to zero: %w", namespace, name, err)
+	}
+	return nil
+}
+
+// WaitNoPods blocks until no pod in any namespace matches labelSelector.
+func (c *Client) WaitNoPods(ctx context.Context, labelSelector string, timeout time.Duration) error {
+	err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
+		pods, err := c.Typed.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{LabelSelector: labelSelector, Limit: 1})
+		if err != nil {
+			return false, err
+		}
+		return len(pods.Items) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for pods matching %q to stop: %w", labelSelector, err)
+	}
+	return nil
+}
+
+// WaitResourceDeleted blocks until the named object of a resource is gone.
+func (c *Client) WaitResourceDeleted(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, timeout time.Duration) error {
+	res := c.Dynamic.Resource(gvr)
+	err := poll(ctx, timeout, func(ctx context.Context) (bool, error) {
+		var err error
+		if namespace == "" {
+			_, err = res.Get(ctx, name, metav1.GetOptions{})
+		} else {
+			_, err = res.Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		}
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for %s %s to be deleted: %w", gvr.Resource, name, err)
+	}
+	return nil
+}

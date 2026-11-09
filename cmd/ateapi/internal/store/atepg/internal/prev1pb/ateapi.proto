@@ -1,0 +1,687 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The Actor and ActorTemplate wire format of the Amp fork of Substrate before
+// 1.0 (ampcode/substrate 6f793509, proto package "ateapi"), trimmed to the
+// messages those two resources need. atepg decodes the rows a pre-1.0 install
+// stored with these types and re-encodes them in the 1.0 format once, at the
+// first start of a 1.0 ate-api-server (see prev1.go). Nothing else may use
+// this package; it is deleted with that migration.
+
+syntax = "proto3";
+package amp.ateapi.prev1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "go.ate.dev/substrate/cmd/ateapi/internal/store/atepg/internal/prev1pb;prev1pb";
+
+// ObjectSnapshot addresses a snapshot held in object storage.
+message ObjectSnapshot {
+  // snapshot_uri addresses the snapshot's prefix in object storage.
+  string snapshot_uri = 1;
+}
+
+// SnapshotOwner indicates the owner of a snapshot.
+enum SnapshotOwner {
+  SNAPSHOT_OWNER_UNSPECIFIED = 0;
+  // Snapshot captured directly from this Actor.
+  SNAPSHOT_OWNER_ACTOR = 1;
+  // Snapshot owned by a Tag (also includes Golden Snapshot)
+  SNAPSHOT_OWNER_TAG = 2;
+  // Keep this in sync with Snapshot.owner's maximum.
+}
+
+// SnapshotStorageStatus indicates the lifecycle stage of a durable snapshot.
+enum SnapshotStorageStatus {
+  SNAPSHOT_STORAGE_STATUS_UNSPECIFIED = 0;
+  // Snapshot creation in durable storage is in progress.
+  SNAPSHOT_STORAGE_STATUS_PENDING = 1;
+  // Snapshot is complete and ready for use in durable storage.
+  SNAPSHOT_STORAGE_STATUS_COMPLETED = 2;
+  // Keep this in sync with SnapshotStorage.status's maximum.
+}
+
+// SnapshotStorage records the durable storage representation of a Snapshot.
+message SnapshotStorage {
+  // status is the lifecycle status of the durable snapshot.
+  SnapshotStorageStatus status = 1;
+
+  // object snapshot is stored in object storage.
+  ObjectSnapshot object = 2;
+}
+
+// Snapshot represents one generation of an Actor's or Tag's snapshot state.
+message Snapshot {
+  // uuid is the server-generated unique identifier for this snapshot, passed to
+  // atelet to identify the local checkpoint on disk and used as the snapshot
+  // name in object storage.
+  string uuid = 1;
+
+  // generation is the monotonically increasing generation number of this
+  // snapshot, starting at 1.
+  int32 generation = 2;
+
+  // owner identifies the origin and ownership of this snapshot.
+  SnapshotOwner owner = 3;
+
+  // fidelity is what this snapshot holds.
+  SnapshotFidelity fidelity = 4;
+
+  // UID of the ActorTemplate whose sandbox this snapshot's guest state was
+  // captured from.
+  string actor_template_uid = 5;
+
+  // locality identifies the node holding this snapshot's files (currently the
+  // Kubernetes node name). Set when a local pause checkpoint completes, and
+  // cleared once the files are deleted from that node; a resume does not
+  // delete them.
+  string locality = 6;
+
+  // durable_snapshot holds the durable storage representation of this snapshot.
+  // PENDING while the snapshot is uploaded, including a pause's snapshot that
+  // so far exists only on the node named by locality. COMPLETED once the
+  // upload is recorded.
+  SnapshotStorage durable_snapshot = 7;
+
+  // sandbox_runtime is the runtime the actor ran under when the snapshot was
+  // taken.
+  SandboxRuntime sandbox_runtime = 8;
+}
+
+// SnapshotFidelity orders the state layers a snapshot can hold, lowest to
+// highest. Each level includes the ones below it.
+enum SnapshotFidelity {
+  SNAPSHOT_FIDELITY_UNSPECIFIED = 0;
+  // Durable volumes only. The actor resumes by cold-booting its containers
+  // from the OCI image with the volumes restored.
+  SNAPSHOT_FIDELITY_VOLUMES = 1;
+  // Volumes plus the root filesystem changes made since boot. The actor
+  // cold-boots on resume with its rootfs writes back in place.
+  SNAPSHOT_FIDELITY_ROOTFS = 2;
+  // Volumes, root filesystem changes, and process memory. The actor resumes
+  // where it left off.
+  SNAPSHOT_FIDELITY_MEMORY = 3;
+  // Keep this in sync with the maximums on fields of this type.
+}
+
+// Selector matches worker pools by label.
+// Only equality-based matching is supported.
+message Selector {
+  // match_labels selects by exact equality on a set of labels.
+  map<string, string> match_labels = 1;
+}
+
+// ResourceMetadata holds the common fields carried by every Substrate resource.
+message ResourceMetadata {
+  // atespace is the namespace the resource belongs to. Empty for global-scoped
+  // resources. Caller-specified at creation and immutable thereafter.
+  //
+  // Atespaced resources should add `+k8s:subfield(atespace)=+k8s:required`
+  // Non-atespaced resources should add `+k8s:subfield(atespace)=+k8s:forbidden`
+  string atespace = 1;
+
+  // name is the resource's name, unique within its atespace (or globally, for
+  // global-scoped resources). Caller-specified at creation and immutable thereafter.
+  string name = 2;
+
+  // uid is a server-assigned, globally unique identifier for this resource.
+  // Immutable throughout the lifecycle of the resource.
+  //
+  // This field is ignored during create operations and used as precondition
+  // for update operations.
+  string uid = 3;
+
+  // version is increased on every mutation.
+  //
+  // This field is ignored during create operations and used as precondition
+  // for update operations.
+  int64 version = 4;
+
+  // create_time is the time the resource was created.
+  //
+  // This field is ignored on input.
+  google.protobuf.Timestamp create_time = 5;
+
+  // update_time is the time the resource was last updated.
+  //
+  // This field is ignored on input.
+  google.protobuf.Timestamp update_time = 6;
+}
+
+message ExternalVolume {
+  // Name of the volume specified in the actor template. Template volume
+  // names are DNS labels.
+  //
+  // ratchet's nil->set when the final object is validated as an update
+  string name = 1;
+
+  // The globally unique volume_id returned from the storage system.
+  // This will be initially empty during volume creation. Its format is the
+  // storage system's own, so it is only bounded and checked for control
+  // characters (U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+009F).
+  // The CSI spec caps IDs at 128 bytes but does not require it, so allow
+  // some slack. Set once when provisioning completes, then never changed.
+  string storage_volume_id = 2;
+
+  // Internal volume plugin name or CSI driver name, from the StorageClass
+  // provisioner. Must be a DNS subdomain, optionally prefixed with
+  // "substrate.io/" (per the CSI spec's driver-name syntax).
+  string volume_type = 3;
+
+  // volume_context contains metadata returned by the CSI driver during volume
+  // provisioning, needed by the node plugin for mounting (e.g. attachment
+  // info). Keys and values are the driver's own, so the map is only bounded,
+  // not validated.
+  map<string, string> volume_context = 5;
+}
+
+message Actor {
+
+  // Common resource metadata: atespace, name, uid, version, timestamps.
+  ResourceMetadata metadata = 1;
+
+  // TODO: replace with full actor_template spec if we decide to make each Actor self-contained.
+  ObjectRef actor_template = 4;
+
+  // worker_selector is the per-actor placement constraint. The scheduler
+  // evaluates the AND of this selector and the template's workerSelector to
+  // find eligible pools. It narrows the template's selection; pinning a
+  // sandbox class belongs on the template's worker_selector.
+  // Changes take effect on the next ResumeActor call.
+  Selector worker_selector = 5;
+
+  // The tag specified by the caller at CreateActor to seed this Actor from an
+  // ActorSnapshot. Unset if the Actor was not created from a snapshot. Set
+  // once at creation and immutable afterward.
+  ObjectRef source_tag = 6;
+
+  // status is the system-managed state of the Actor. It is updated by the
+  // server and ignored on input. It is always present in output.
+  ActorStatus status = 7;
+}
+
+enum ActorState {
+  ACTOR_STATE_UNSPECIFIED = 0;
+  ACTOR_STATE_RESUMING = 1;
+  ACTOR_STATE_RUNNING = 2;
+  ACTOR_STATE_SUSPENDING = 3;
+  ACTOR_STATE_SUSPENDED = 4;
+  ACTOR_STATE_CRASHED = 7;
+  ACTOR_STATE_DELETING = 8;
+  ACTOR_STATE_REVERTING = 9;
+  // Keep this in sync with ActorStatus.state's maximum.
+}
+
+message ActorStatus {
+  // state is the Actor's current lifecycle state.
+  ActorState state = 1;
+
+  // worker_assignment points at the worker currently hosting this Actor.
+  // Unset whenever the Actor has no worker (SUSPENDED, CRASHED).
+  WorkerAssignment worker_assignment = 2;
+
+  // Volumes attached to the actor. These volumes only live as long as the actor.
+  // They are deleted when the actor is deleted. Each template volume
+  // appears at most once.
+  //
+  // +ate:preview=ExternalVolumes
+  repeated ExternalVolume external_volumes = 7;
+
+  // crash records why and when the Actor entered CRASHED. It is set with the
+  // CRASHED state and cleared when a revert returns the Actor to SUSPENDED.
+  ActorCrash crash = 9;
+
+  // assigned_node is the Kubernetes node the Actor is currently attached to
+  // (hosting its active worker or its node-local snapshots). Unset when the
+  // Actor is detached from any node.
+  string assigned_node = 10;
+
+  // snapshots holds the Actor's active and in-progress snapshot generations.
+  repeated Snapshot snapshots = 11;
+
+  // last_assigned_generation tracks the last snapshot generation assigned for
+  // this Actor during a Suspend or Pause request.
+  // Even during Revert, the generation is not decreased to keep track of snapshots
+  // that have become stale and need to be cleaned up.
+  int32 last_assigned_generation = 12;
+}
+
+// ActorCrash describes the failure that moved an Actor to CRASHED.
+message ActorCrash {
+  // message is a human-readable description of the failure.
+  string message = 1;
+
+  // crash_time is when the Actor entered CRASHED.
+  google.protobuf.Timestamp crash_time = 2;
+}
+
+// WorkerAssignment points at the Worker currently hosting an Actor.
+//
+// This is a denormalized snapshot, not merely a reference: atenet reads
+// worker_pod_ips on the request-routing path and must not need a second lookup,
+// and kubectl-ate displays the pod name. The copies stay valid for the life of
+// the assignment because a Worker's identity fields are immutable.
+//
+// Pass `worker` to GetWorker; none of the denormalized fields identify the
+// Worker to the API.
+message WorkerAssignment {
+  // worker references the assigned Worker. This is the field to look the Worker
+  // up by; the worker_* fields below are a denormalized copy kept so that
+  // readers on a hot path do not have to fetch the Worker at all.
+  //
+  // Workers are global-scoped, so this carries no atespace.
+  ObjectRef worker = 6;
+
+  // worker_namespace is the Kubernetes namespace of the WorkerPool and worker Pod.
+  string worker_namespace = 1;
+
+  // worker_pool is the name of the WorkerPool the worker belongs to.
+  string worker_pool = 2;
+
+  // worker_pod is the name of the Kubernetes pod hosting the Actor.
+  string worker_pod = 3;
+
+  // worker_pod_uid is the Kubernetes UID of worker_pod.
+  string worker_pod_uid = 4;
+
+  // worker_pod_ips are the IPs of worker_pod, copied from Worker.ips.
+  repeated string worker_pod_ips = 5;
+
+  // node_name is the Kubernetes node hosting worker_pod.
+  string node_name = 7;
+
+  // worker_epoch is the Worker's epoch when the Actor was placed on it. 0 if
+  // the Worker had not reported one.
+  int64 worker_epoch = 8;
+
+  // sandbox_runtime is the sandbox runtime and compatibility version the Actor
+  // was started or restored under on this Worker.
+  SandboxRuntime sandbox_runtime = 9;
+
+  // worker_spiffe_id is the SPIFFE ID worker_pod's certificate carries, copied
+  // from Worker.worker_spiffe_id.
+  string worker_spiffe_id = 10;
+}
+
+// ObjectRef references a Substrate resource by its atespace and name.
+message ObjectRef {
+  // The atespace of the referenced resource. This field should be empty if the
+  // target resource is global-scoped, but references to objects in the same
+  // atespace as the referrer must still populate this field.
+  //
+  // References to atespaced resources should add `+k8s:subfield(atespace)=+k8s:required`
+  // References to non-atespaced resources should add `+k8s:subfield(atespace)=+k8s:forbidden`
+  string atespace = 1;
+
+  // The name of the referenced resource. This field is required.
+  string name = 2;
+}
+
+message ActorTemplate {
+
+  // Common resource metadata: atespace, name, uid, version, timestamps.
+  ResourceMetadata metadata = 1;
+
+  // worker_selector restricts which worker pools actors from this template
+  // may use, by matching the pools' labels. Unset, every pool is eligible.
+  //
+  // The pool decides the sandbox class an actor runs in, so this selector is
+  // also how a template pins one: if the cluster runs pools of more than one
+  // sandbox class and the workload needs a particular one, select only pools
+  // of that class. An actor booting with no snapshot and no selector may land
+  // on a pool of any class, and keeps that class from its first checkpoint on.
+  Selector worker_selector = 2;
+
+  repeated Container containers = 3;
+
+  repeated Volume volumes = 4;
+
+  SnapshotConfig snapshot_config = 5;
+
+  // resources is the actor's compute size. Both cpu and memory limits are
+  // required: the scheduler books them against worker capacity, and a
+  // micro-VM is booted at that size.
+  Resources resources = 7;
+
+  ActorTemplateStatus status = 8;
+}
+
+message Resources {
+  // limits is the maximum amount of compute resources allowed. Only "cpu"
+  // and "memory" are supported, each at most once, and each quantity must be
+  // greater than zero; the cpu limit must be less than 1000 cores.
+  repeated Limits limits = 1;
+}
+
+message Limits {
+  string name = 1;
+
+  // quantity is in Kubernetes resource.Quantity string form (e.g. "500m",
+  // "2Gi").
+  string quantity = 2;
+}
+
+message GoldenSnapshotStatus {
+  // golden_tag owns the immutable snapshot built by the template controller.
+  // Set after tagging the snapshot and deleting the temporary golden Actor.
+  ObjectRef golden_tag = 1;
+
+  // snapshot_time is when the golden-actor warmup ends and the
+  // golden snapshot may be taken.
+  google.protobuf.Timestamp snapshot_time = 2;
+
+  // error_message is set when the golden snapshot build fails and will not be
+  // retried, formatted as "<Reason>: <detail>". A nonempty value is terminal.
+  string error_message = 3;
+}
+
+message ActorTemplateStatus {
+  GoldenSnapshotStatus golden_snapshot_status = 1;
+}
+
+// SnapshotConfig selects what actor snapshots capture and where they are
+// stored.
+message SnapshotConfig {
+  // storage_location is the base object-storage URI snapshots of actors on
+  // this version are stored under. Required.
+  string storage_location = 1;
+
+  // preferred_fidelity is the highest fidelity the system packages when it
+  // snapshots the actor, on pause (node-local) and on suspend (uploaded).
+  // It is a best-effort ceiling, not a guarantee: the system never packages
+  // more than this level, and it may package less when a layer cannot be
+  // captured or is too expensive to capture at the time, for example memory
+  // under host pressure. A process resumed in place on its worker keeps its
+  // memory regardless of this setting. Defaults to MEMORY when unset.
+  SnapshotFidelity preferred_fidelity = 2;
+
+  // golden_snapshot_config configures automated golden snapshot creation.
+  // Golden snapshots are enabled when this config is omitted.
+  GoldenSnapshotConfig golden_snapshot_config = 5;
+}
+
+// GoldenSnapshotMode selects whether a template builds a golden snapshot.
+enum GoldenSnapshotMode {
+  GOLDEN_SNAPSHOT_MODE_UNSPECIFIED = 0;
+  GOLDEN_SNAPSHOT_MODE_ENABLED = 1;
+  GOLDEN_SNAPSHOT_MODE_DISABLED = 2;
+}
+
+// GoldenSnapshotConfig controls automated golden snapshot creation for a template.
+message GoldenSnapshotConfig {
+  // mode defaults to ENABLED when unspecified. DISABLED skips creating the
+  // template's golden actor and tag.
+  GoldenSnapshotMode mode = 1;
+}
+
+// Container is a single application container of an ActorTemplate.
+message Container {
+  string name = 1;
+
+  // image is the OCI image reference the container runs:
+  // [registry/]repository[:tag]@digest. Must be pinned by digest
+  // (e.g. "name@sha256:...").
+  string image = 2;
+
+  // Entrypoint array; when set, the image's ENTRYPOINT and CMD are both
+  // ignored and the process argv is command + args. Unlike Kubernetes,
+  // $(VAR_NAME) references are NOT expanded.
+  repeated string command = 3;
+
+  // Arguments to the entrypoint; the image's CMD is used if unset (unless
+  // command is set, which discards the image's CMD).
+  repeated string args = 4;
+
+  // Env variables to set in the container's process environment. Unlike
+  // Kubernetes, $(VAR_NAME) references are NOT expanded in this field.
+  repeated EnvVar env = 5;
+
+  // wakeup_probe gates each wakeup on this container: ResumeActor returns
+  // only after the probe answers HTTP 200. Without it, ResumeActor returns
+  // as soon as the container has started, which may be before it listens.
+  WakeupProbe wakeup_probe = 6;
+
+  // Keyed by mount_path: each path hosts exactly one mount, while a volume
+  // may be mounted at multiple paths.
+  repeated VolumeMount volume_mounts = 7;
+
+  // security_context adjusts the container's security settings. Unset leaves
+  // the default capability set.
+  SecurityContext security_context = 8;
+
+  // resources carries this container's compute limits, enforced inside the
+  // actor's sandbox. Only cpu and memory limits are supported.
+  Resources resources = 9;
+}
+
+// SecurityContext holds security settings for a container's process,
+// modeling a subset of the Kubernetes container securityContext.
+message SecurityContext {
+  // capabilities adjusts the Linux capabilities of the container's process.
+  Capabilities capabilities = 1;
+}
+
+// Capabilities adjusts a container's Linux capabilities relative to the
+// default set. Drop applies first, then add, so a capability in both is
+// granted. Capabilities are named without the "CAP_" prefix; "ALL" in drop
+// removes the whole default set.
+message Capabilities {
+  // add lists capabilities to grant on top of the default set. "ALL" is
+  // rejected: name the individual capabilities the container needs.
+  repeated string add = 1;
+
+  // drop lists capabilities to remove from the default set. "ALL" drops the
+  // whole set, so drop+add expresses an exact set rather than a relative one.
+  repeated string drop = 2;
+}
+
+// EnvVar supplies one environment variable to a container. Values are not
+// expanded with Kubernetes-style $(VAR) references.
+message EnvVar {
+  // name may be any printable ASCII character except '='.
+  string name = 1;
+
+  // value is the literal value.
+  string value = 2 [ debug_redact = true ];
+}
+
+// WakeupProbe tells the platform when a container is serving. It is
+// polled on every wakeup, whether the actor cold-boots or is restored from a
+// snapshot, and not again while the actor stays running. A probe that does
+// not answer 200 within timeout_seconds crashes the actor.
+message WakeupProbe {
+  // http_get is the request to poll.
+  HttpGetAction http_get = 1;
+
+  // timeout_seconds is how long to keep polling before giving up.
+  // Defaults to 30 when unset.
+  int32 timeout_seconds = 2;
+}
+
+// HttpGetAction describes the HTTP GET the probe polls.
+message HttpGetAction {
+  // path must be a URL path starting with "/", using only RFC 3986
+  // path-segment characters, without query or fragment.
+  // Defaults to "/" when unset.
+  string path = 1;
+
+  // port is the container port to connect to.
+  int32 port = 2;
+}
+
+message Volume {
+  // name of the volume. Must be a DNS label.
+  string name = 1;
+
+  // Exactly one of durable_dir / external_volume_template / image /
+  // system_info must be set.
+  DurableDirVolumeSource durable_dir = 2;
+
+  // +ate:preview=ExternalVolumes
+  ExternalVolumeTemplate external_volume_template = 3;
+
+  SystemInfoVolumeSource system_info = 5;
+
+  // image mounts the contents of an OCI image, read-only.
+  ImageVolumeSource image = 6;
+}
+
+// ImageVolumeSource mounts the contents of an OCI image, read-only. The
+// reference must include a digest: changing the image invalidates
+// snapshots.
+message ImageVolumeSource {
+  // reference is the OCI image reference. Must include a digest
+  // (e.g. "name@sha256:...").
+  string reference = 1;
+}
+
+// DurableDirVolumeSource is a durable directory on rootfs that persists
+// across resumes and participates in snapshots.
+message DurableDirVolumeSource {}
+
+// ExternalVolumeTemplate provisions an external volume per actor; the volume
+// lives only as long as the actor.
+message ExternalVolumeTemplate {
+  // capacity of the volume to create, in Kubernetes resource.Quantity string
+  // form (e.g. "10Gi"). Required.
+  string capacity = 1;
+
+  // storage_class_name names the cluster-scoped Kubernetes StorageClass to
+  // create the volume from. Required.
+  string storage_class_name = 2;
+}
+
+// SystemInfoVolumeSource is a read-only volume of substrate-generated
+// per-actor files (identity fields, projected trust bundles), regenerated by
+// atelet on every Run/Restore.
+message SystemInfoVolumeSource {
+  // data_sources lists the projections to place within the volume. At most
+  // one actor_metadata entry may appear, and file paths must be unique
+  // across all entries.
+  repeated SystemInfoDataSource data_sources = 1;
+}
+
+message SystemInfoDataSource {
+  // Exactly one of actor_metadata / trust_bundle must be set.
+  ActorMetadataDataSource actor_metadata = 1;
+
+  TrustBundleDataSource trust_bundle = 2;
+}
+
+// ActorMetadataDataSource projects the actor's identity fields to files, one
+// per item.
+message ActorMetadataDataSource {
+  // items must not project the same field twice, and item paths must be
+  // unique.
+  repeated ActorMetadataItem items = 1;
+}
+
+// ActorMetadataItem projects one actor identity field to a file at path,
+// a clean relative Unix path from the root of the volume.
+message ActorMetadataItem {
+  ActorMetadataField field = 1;
+
+  // path must be a clean relative Unix path: at most 16 '/'-separated
+  // segments, none of them empty, '.' or '..', and no NUL byte.
+  string path = 2;
+}
+
+// ActorMetadataField selects one identity field of the actor.
+enum ActorMetadataField {
+  ACTOR_METADATA_FIELD_UNSPECIFIED = 0;
+  ACTOR_METADATA_FIELD_NAME = 1;
+  ACTOR_METADATA_FIELD_ATESPACE = 2;
+  ACTOR_METADATA_FIELD_UID = 3;
+  // Keep this in sync with ActorMetadataItem.field's maximum.
+}
+
+// TrustBundleDataSource projects the trust anchors of the named trust bundle
+// to a PEM file at path. Supported names are allowlisted in atelet.
+message TrustBundleDataSource {
+  // One or more named trust bundles to unify and place at the specified path.
+  //
+  // Substrate supports a short list of predefined names:
+  //
+  // * egress-mitm.ate.dev --- The trust anchors for the Substrate egress
+  //   gateway TLS man-in-the-middle interceptor.
+  //
+  // * system-roots.ate.dev --- A selection of well-known public CA root certificates,
+  //   built into Substrate
+  repeated string names = 3;
+
+  // path must be a clean relative Unix path: at most 16 '/'-separated
+  // segments, none of them empty, '.' or '..', and no NUL byte.
+  string path = 2;
+
+  reserved 1;
+  reserved "name";
+}
+
+// VolumeMount mounts a named Volume into a container.
+message VolumeMount {
+  // name must match the name of a Volume.
+  string name = 1;
+
+  // mount_path within the container. Must be a clean absolute Unix path:
+  // must start with '/', not be '/', and contain no ':', '..', '.', '//',
+  // trailing '/', or control characters.
+  string mount_path = 2;
+}
+
+// SandboxRuntime describes a sandbox runtime and its compatibility identity as
+// reported by a Worker or recorded on a snapshot.
+message SandboxRuntime {
+  // e.g. "gvisor", "microvm"
+  string sandbox_class = 1;
+
+  // Primary compatibility version stamped onto an actor's snapshot when a
+  // checkpoint is taken on this runtime. Snapshots matching `version`
+  // can warm-boot on this runtime.
+  // TODO: Add support for additional compatibility versions.
+  VersionedSandboxCompat version = 2;
+
+  // TODO: Add an informational SandboxConfig version name (e.g. "gvisor-2")
+  // once workers report one.
+}
+
+// VersionedSandboxCompat holds the compatibility schema version and the
+// key-value compatibility attributes for a SandboxRuntime.
+message VersionedSandboxCompat {
+  // Compatibility schema version (e.g. "v1") defining which runtime and
+  // hardware attributes are recorded and how they are computed.
+  string schema_version = 1;
+
+  // Key-value compatibility attributes defined by this schema version, covering
+  // both runtime assets (e.g. "sandbox_bundle_hash") and effective guest
+  // hardware features after masking (e.g. "architecture", "cpu_features").
+  // Matched against a snapshot under the same schema_version: every attribute
+  // on the snapshot must be present on the worker with an equal value (except
+  // "cpu_features", where the snapshot's hexadecimal bitmask must be a bitwise
+  // subset of the worker's); keys only the worker has are ignored, so a worker
+  // can gain keys under one schema_version without invalidating older
+  // snapshots. Removing or recomputing a key is a new schema_version, under
+  // which older snapshots no longer match.
+  // Order as sent does not matter: ate-api-server sorts attributes by key
+  // before recording them.
+  repeated AttributeEntry attributes = 2;
+}
+
+// AttributeEntry is a single key-value compatibility attribute.
+message AttributeEntry {
+  // Attribute name (e.g. "architecture", "cpu_features", "sandbox_bundle_hash").
+  string key = 1;
+
+  // Attribute value corresponding to key.
+  string value = 2;
+}

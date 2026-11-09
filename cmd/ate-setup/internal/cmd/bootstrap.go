@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,7 +29,12 @@ import (
 	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
 )
 
-var helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath string
+var (
+	helmRelease, helmReleaseNamespace, crdsPath, admissionPoliciesPath string
+	v1alpha1Upgrade                                                    bool
+	v1alpha1UpgradeScaleDown                                           []string
+	v1alpha1UpgradeTimeout                                             time.Duration
+)
 
 // bootstrapCmd is the part of "deploy ate-system" that manifests cannot carry:
 // the generated key material and the config derived from the cluster. It runs
@@ -48,7 +54,11 @@ adopt them. With --crds the CRDs in that directory are applied too, which is
 how a chart upgrades them: Helm installs a chart's CRDs once and never changes
 them. --admission-policies applies the manifests in that directory right after
 the CRDs, so the resources applied next are checked by the current policies and
-not by the previous release's.`,
+not by the previous release's. --v1alpha1-upgrade stops an install from before
+1.0 first (scales down the Deployments named by --v1alpha1-upgrade-scale-down,
+deletes its WorkerPools so every running sandbox is suspended, stops its
+control plane, and deletes its v1alpha1 CRDs) and does nothing on a cluster
+that is not one.`,
 	Args: cobra.NoArgs,
 	// Replaces the root hook: that one needs a repository checkout for
 	// .ate-dev-env.sh and the manifests, and fetches GKE credentials, none of
@@ -73,6 +83,16 @@ not by the previous release's.`,
 		ctx := cmd.Context()
 		for _, name := range []string{steps.NamespaceAteSystem, steps.NamespacePodCert, "otel-system"} {
 			if err := applyNamespace(ctx, name); err != nil {
+				return err
+			}
+		}
+		// Before the new CRDs: 1.0 has no conversion from v1alpha1, so the
+		// old CRDs are replaced, after the old install stopped cleanly.
+		if v1alpha1Upgrade {
+			if err := env.UpgradeFromV1alpha1(ctx, steps.V1alpha1Upgrade{
+				ScaleDown: v1alpha1UpgradeScaleDown,
+				Timeout:   v1alpha1UpgradeTimeout,
+			}); err != nil {
 				return err
 			}
 		}
@@ -132,4 +152,7 @@ func init() {
 	f.StringVar(&helmReleaseNamespace, "helm-release-namespace", "", "Namespace of that Helm release")
 	f.StringVar(&crdsPath, "crds", "", "Directory of CRD manifests to apply before anything else (none by default)")
 	f.StringVar(&admissionPoliciesPath, "admission-policies", "", "Directory of admission policy manifests to apply after the CRDs (none by default)")
+	f.BoolVar(&v1alpha1Upgrade, "v1alpha1-upgrade", false, "Stop a pre-1.0 install (v1alpha1 CRDs) before applying the CRDs; no-op on any other cluster")
+	f.StringSliceVar(&v1alpha1UpgradeScaleDown, "v1alpha1-upgrade-scale-down", nil, "Deployments (namespace/name) to scale to zero before the pre-1.0 worker pools are deleted")
+	f.DurationVar(&v1alpha1UpgradeTimeout, "v1alpha1-upgrade-timeout", time.Hour, "How long to wait for each step of the pre-1.0 upgrade: the scale-downs, the worker pods suspending their sandboxes, and the CRD deletion")
 }

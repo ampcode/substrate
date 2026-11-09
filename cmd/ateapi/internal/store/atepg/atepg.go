@@ -308,6 +308,9 @@ func newPersistence(ctx context.Context, pool, watchPool, ownerPool, probePool *
 	if err := applyMigrations(ctx, ownerPool); err != nil {
 		return nil, err
 	}
+	if err := upgradePreV1Records(ctx, ownerPool); err != nil {
+		return nil, err
+	}
 	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
 	p := &Persistence{
 		pool:                  pool,
