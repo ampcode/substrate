@@ -143,6 +143,13 @@ upstream ships its equivalent. The series is:
   credential provider).
 - `manifests/ate-install/atenet-egress.yaml`: explicit circuit breakers on
   the egress gateway's forwarding clusters.
+- `atelet`: containers run as root in `/` unless `--run-as-image-user` is set
+  (upstream runs them as the image's `USER` and in its `WORKDIR` since 1.0).
+  Amp's sandbox image names a non-root `USER`, but its init process must be
+  root, and actors paused before 1.0 restore only into the identity they were
+  taken with. The `e2e` component sets the flag so upstream's suites still hold.
+- `internal/resources`: `capabilities.add` also accepts `MKNOD`, `NET_ADMIN`,
+  `NET_RAW` and `SYS_ADMIN`, which dockerd inside a gVisor sandbox needs.
 - `ateapi`: `CreateTag` also accepts a `RUNNING` source actor and tags the
   snapshot its last suspend uploaded, so a live sandbox can be snapshotted
   with `SuspendActor(ASYNCHRONOUS)` → `ResumeActor` → `CreateTag` once the

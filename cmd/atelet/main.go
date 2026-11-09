@@ -124,6 +124,7 @@ var (
 	dockerConfigAuthForImagePulls = pflag.Bool("docker-config-auth-for-image-pulls", true, "Authenticate image pulls with the Docker config file ($DOCKER_CONFIG/config.json, else $HOME/.docker/config.json), the format of a kubernetes.io/dockerconfigjson Secret, before the credential providers. Registries the file has no entry for fall through to them.")
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
+	runAsImageUser               = pflag.Bool("run-as-image-user", false, "Run each container as its image's USER and in its WORKDIR, as upstream Substrate does since 1.0. Off (this fork's default), every container runs as root in /, as before 1.0: Amp's sandbox image names a non-root USER for its interactive shells, but its init process (orbd) must be root to start dockerd and switch to that user itself, and gVisor restores a snapshot only into a container with the user and working directory it was taken with, so this also keeps actors paused before 1.0 resumable.")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
@@ -473,6 +474,7 @@ func main() {
 		workerService,
 		bootID,
 	)
+	wmService.runAsImageUser = *runAsImageUser
 	store.s = wmService
 	snapshots.Start()
 	go systemInfoVolumes.run(ctx)
@@ -750,6 +752,10 @@ type Atelet struct {
 
 	workerDialer *WorkerDialer
 	imageCache   *imagecache.Store
+	// runAsImageUser runs each container as its image's USER and in its WORKDIR
+	// (upstream's behavior since 1.0). Off, every container runs as root in "/",
+	// as before 1.0; see --run-as-image-user.
+	runAsImageUser bool
 	// sandboxAssetCache holds every sandbox asset on the node once; actors get hard
 	// links into their own directories (see ensureSandboxAssets).
 	sandboxAssetCache *filecache.Store
@@ -2288,7 +2294,7 @@ func (s *Atelet) prepareOCIBundles(
 			envs = append(envs, fmt.Sprintf("%s=%s", env.GetName(), env.GetValue()))
 		}
 		g.Go(func() error {
-			img, cwd, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ctr.GetName(), ctr.GetImage(), spec.GetVolumes(), ctr.GetVolumeMounts())
+			img, cwd, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ctr.GetName(), ctr.GetImage(), spec.GetVolumes(), ctr.GetVolumeMounts(), s.runAsImageUser)
 			if err != nil {
 				return wrapFileSystemErr(fmt.Sprintf("while creating %q OCI bundle", ctr.GetName()), err)
 			}
@@ -2296,9 +2302,12 @@ func (s *Atelet) prepareOCIBundles(
 			if err != nil {
 				return fmt.Errorf("while resolving process args for container %q: %w", ctr.GetName(), err)
 			}
-			user, err := resolveImageUser(img)
-			if err != nil {
-				return fmt.Errorf("while resolving user for container %q: %w", ctr.GetName(), err)
+			var user *ateworkerpb.ProcessUser
+			if s.runAsImageUser {
+				user, err = resolveImageUser(img)
+				if err != nil {
+					return fmt.Errorf("while resolving user for container %q: %w", ctr.GetName(), err)
+				}
 			}
 			containerSpecs[i] = &ateworkerpb.ContainerSpec{
 				Args:         args,

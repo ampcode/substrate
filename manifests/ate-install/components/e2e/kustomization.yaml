@@ -41,3 +41,9 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/args/-
         value: --snapshot-detach-delay=30s
+      # Upstream's e2e suites expect containers to run as their image's USER
+      # and in its WORKDIR; this fork's atelet runs them as root in / unless
+      # told otherwise.
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --run-as-image-user

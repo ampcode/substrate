@@ -82,8 +82,9 @@ func resolveCapabilities(caps *ateletpb.Capabilities) []string {
 
 // prepareOCIDirectory pulls the container's image and writes the overlay spec
 // the worker composes its rootfs from. It returns the image and the process's
-// working directory, which the worker creates through the overlay.
-func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, actorUID, containerName, ref string, volumes []*ateletpb.Volume, volumeMounts []*ateletpb.VolumeMount) (*imagecache.Image, string, error) {
+// working directory, which the worker creates through the overlay: the image's
+// WORKDIR when imageWorkdir is set, else "/".
+func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, actorUID, containerName, ref string, volumes []*ateletpb.Volume, volumeMounts []*ateletpb.VolumeMount, imageWorkdir bool) (*imagecache.Image, string, error) {
 	tracer := otel.Tracer("prepareOCIDirectory")
 
 	ctx, span := tracer.Start(ctx, "prepareOCIDirectory")
@@ -131,9 +132,12 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 	if err := g.Wait(); err != nil {
 		return nil, "", err
 	}
-	cwd, err := resolveCwd(&img.Config)
-	if err != nil {
-		return nil, "", fmt.Errorf("while resolving the working directory of container %q: %w", containerName, err)
+	cwd := "/"
+	if imageWorkdir {
+		var err error
+		if cwd, err = resolveCwd(&img.Config); err != nil {
+			return nil, "", fmt.Errorf("while resolving the working directory of container %q: %w", containerName, err)
+		}
 	}
 
 	// Every bind target must exist in the rootfs for the mount to attach, and

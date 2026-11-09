@@ -274,9 +274,9 @@ func TestPrepareOCIBundlesFillsContainerSpec(t *testing.T) {
 	}
 }
 
-// TestPrepareOCIBundlesResolvesUsers pins that a container runs as its image's
-// USER, resolved against the image's own passwd and group files; a USER the
-// image cannot resolve fails the run.
+// TestPrepareOCIBundlesResolvesUsers pins that under --run-as-image-user a
+// container runs as its image's USER, resolved against the image's own passwd
+// and group files; a USER the image cannot resolve fails the run.
 func TestPrepareOCIBundlesResolvesUsers(t *testing.T) {
 	useTempNodeDirs(t)
 	host := imageVolumeTestRegistry(t)
@@ -285,7 +285,7 @@ func TestPrepareOCIBundlesResolvesUsers(t *testing.T) {
 		singleFileLayer(t, "etc/group", "root:x:0:\nnonroot:x:65532:\nvideo:x:44:nonroot\n"),
 	}
 	app := pushTestImageWithConfig(t, host+"/app:v1", v1.Config{User: "nonroot", Cmd: []string{"/bin/app"}}, etc...)
-	s := &Atelet{imageCache: newImageVolumeStore(t)}
+	s := &Atelet{imageCache: newImageVolumeStore(t), runAsImageUser: true}
 
 	spec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: app}}}
 	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec)
@@ -304,8 +304,9 @@ func TestPrepareOCIBundlesResolvesUsers(t *testing.T) {
 	}
 }
 
-// TestPrepareOCIBundlesStartsInTheImageWorkdir pins that a container starts in
-// its image's WORKDIR, created through the overlay when the image lacks it.
+// TestPrepareOCIBundlesStartsInTheImageWorkdir pins that under
+// --run-as-image-user a container starts in its image's WORKDIR, created
+// through the overlay when the image lacks it.
 func TestPrepareOCIBundlesStartsInTheImageWorkdir(t *testing.T) {
 	useTempNodeDirs(t)
 	host := imageVolumeTestRegistry(t)
@@ -313,7 +314,7 @@ func TestPrepareOCIBundlesStartsInTheImageWorkdir(t *testing.T) {
 	spec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: image}}}
 
 	const actorUID = "actor-uid-1"
-	s := &Atelet{imageCache: newImageVolumeStore(t)}
+	s := &Atelet{imageCache: newImageVolumeStore(t), runAsImageUser: true}
 	got, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec)
 	if err != nil {
 		t.Fatalf("prepareOCIBundles: %v", err)
@@ -327,6 +328,41 @@ func TestPrepareOCIBundlesStartsInTheImageWorkdir(t *testing.T) {
 	}
 	if !slices.Contains(overlay.ExtraDirs, "/home/nonroot") {
 		t.Errorf("ExtraDirs = %v, want the working directory", overlay.ExtraDirs)
+	}
+}
+
+// TestPrepareOCIBundlesRunsAsRootByDefault pins this fork's default: without
+// --run-as-image-user a container runs as root in "/" whatever USER and
+// WORKDIR its image names, as every container did before 1.0, so orbd starts
+// as root and actors paused before 1.0 restore into the same identity.
+func TestPrepareOCIBundlesRunsAsRootByDefault(t *testing.T) {
+	useTempNodeDirs(t)
+	host := imageVolumeTestRegistry(t)
+	etc := []v1.Layer{
+		singleFileLayer(t, "etc/passwd", "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000::/home/user:/bin/sh\n"),
+		singleFileLayer(t, "etc/group", "root:x:0:\nuser:x:1000:\n"),
+	}
+	image := pushTestImageWithConfig(t, host+"/app:v1", v1.Config{User: "user", WorkingDir: "/home/user", Cmd: []string{"/bin/app"}}, etc...)
+	spec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: image}}}
+
+	const actorUID = "actor-uid-1"
+	s := &Atelet{imageCache: newImageVolumeStore(t)}
+	got, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec)
+	if err != nil {
+		t.Fatalf("prepareOCIBundles: %v", err)
+	}
+	if got[0].GetUser() != nil {
+		t.Errorf("User = %v, want nil (root)", got[0].GetUser())
+	}
+	if cwd := got[0].GetCwd(); cwd != "/" {
+		t.Errorf("Cwd = %q, want /", cwd)
+	}
+	overlay, err := imagecache.ReadSpec(ateletpath.OCIBundlePath(actorUID, "app"))
+	if err != nil {
+		t.Fatalf("imagecache.ReadSpec: %v", err)
+	}
+	if slices.Contains(overlay.ExtraDirs, "/home/user") {
+		t.Errorf("ExtraDirs = %v, want no working directory", overlay.ExtraDirs)
 	}
 }
 

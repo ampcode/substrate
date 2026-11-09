@@ -805,41 +805,41 @@ func TestRenderE2ETuning(t *testing.T) {
 			cfg:        config.Config{Router: config.RouterEnvoy},
 			path:       func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
 			wantAtelet: true,
-			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name:       "kind bundle",
 			cfg:        config.Config{Router: config.RouterEnvoy, Kind: true},
 			path:       func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
 			wantAtelet: true,
-			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name:       "agentgateway bundle",
 			cfg:        config.Config{Router: config.RouterAgentgateway},
 			path:       func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
 			wantAtelet: true,
-			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name:       "kind agentgateway bundle",
 			cfg:        config.Config{Router: config.RouterAgentgateway, Kind: true},
 			path:       func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
 			wantAtelet: true,
-			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name:       "atelet file",
 			path:       func(e *Env) string { return e.Cfg.Manifest("atelet.yaml") },
 			wantAtelet: true,
-			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name:       "kind atelet overlay",
 			cfg:        config.Config{Kind: true},
 			path:       func(e *Env) string { return e.ateletManifestPath() },
 			wantAtelet: true,
-			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s"},
+			wantArgs:   []string{"--localhost-registry-replacement=kind-registry:5000", "--log-level=debug", "--snapshot-upload-delay=2s", "--snapshot-detach-delay=30s", "--run-as-image-user"},
 		},
 		{
 			name: "api server file without atelet",
@@ -885,7 +885,7 @@ func TestRenderE2ETuning(t *testing.T) {
 			t.Errorf("kind atelet args = %v, missing --log-level=debug", args)
 		}
 		for _, arg := range args {
-			if strings.HasPrefix(arg, "--snapshot-upload-delay") || strings.HasPrefix(arg, "--snapshot-detach-delay") {
+			if strings.HasPrefix(arg, "--snapshot-upload-delay") || strings.HasPrefix(arg, "--snapshot-detach-delay") || arg == "--run-as-image-user" {
 				t.Errorf("kind atelet without --e2e-tuning carries %q in args %v", arg, args)
 			}
 		}
