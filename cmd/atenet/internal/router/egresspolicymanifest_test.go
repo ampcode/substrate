@@ -15,6 +15,8 @@
 package router
 
 import (
+	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -785,6 +787,68 @@ func TestEgressManifestsPassthroughChainDialsTheResolvedSNI(t *testing.T) {
 	}
 	if writers := filterStateWriters(tree, extproc.OriginalDstFilterStateKey); len(writers) != 0 {
 		t.Errorf("%s is written by %d filters; the gateway must not carry the address the actor dialed to the inner listener", extproc.OriginalDstFilterStateKey, len(writers))
+	}
+}
+
+// The filter must live in every declaration of the shared cache: Envoy rejects
+// differing configurations, and an unchecked declaration would restore the bypass.
+func TestEgressDNSCacheRejectsNonPublicAnswers(t *testing.T) {
+	tree := bootstrapTree(t)
+	var caches []node
+	var visit func(any)
+	visit = func(value any) {
+		switch value := value.(type) {
+		case node:
+			for key, child := range value {
+				if key == "dns_cache_config" {
+					if cache, ok := child.(node); ok && str(cache, "name") == "egress_dns_cache" {
+						caches = append(caches, cache)
+					}
+				}
+				visit(child)
+			}
+		case []any:
+			for _, child := range value {
+				visit(child)
+			}
+		}
+	}
+	visit(tree)
+	if len(caches) != 7 {
+		t.Fatalf("found %d egress DNS cache declarations, want 7", len(caches))
+	}
+	want := mustJSON(t, caches[0])
+	for _, cache := range caches[1:] {
+		if got := mustJSON(t, cache); got != want {
+			t.Errorf("egress DNS cache differs: %s != %s", got, want)
+		}
+	}
+	filter := child(caches[0], "resolved_address_filter")
+	if filter == nil || filter["invert_match"] == true {
+		t.Fatal("egress DNS cache must filter matching denied ranges")
+	}
+	var denied []netip.Prefix
+	for _, item := range list(filter, "ranges") {
+		prefix, err := netip.ParsePrefix(fmt.Sprintf("%s/%v", str(item, "address_prefix"), item["prefix_len"]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		denied = append(denied, prefix)
+	}
+	for address, blocked := range map[string]bool{
+		"127.0.0.1": true, "10.2.3.4": true, "172.17.0.1": true,
+		"192.168.0.1": true, "169.254.169.254": true, "100.64.0.1": true,
+		"::1": true, "::ffff:127.0.0.1": true, "fc00::1": true, "fe80::1": true,
+		"8.8.8.8": false, "2606:4700:4700::1111": false,
+	} {
+		ip := netip.MustParseAddr(address)
+		matches := false
+		for _, prefix := range denied {
+			matches = matches || prefix.Contains(ip)
+		}
+		if matches != blocked {
+			t.Errorf("resolved address %s blocked = %t, want %t", address, matches, blocked)
+		}
 	}
 }
 

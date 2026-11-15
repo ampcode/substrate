@@ -581,6 +581,38 @@ data:
                     # returns both families and enables Happy Eyeballs, so
                     # neither family is stranded.
                     dns_lookup_family: ALL
+                    # Envoy filters resolved answers before caching or dialing them.
+                    # Keep this identical on every use of egress_dns_cache.
+                    resolved_address_filter: &egress_denied_addresses
+                      ranges:
+                      - {address_prefix: 0.0.0.0, prefix_len: 8}
+                      - {address_prefix: 10.0.0.0, prefix_len: 8}
+                      - {address_prefix: 100.64.0.0, prefix_len: 10}
+                      - {address_prefix: 127.0.0.0, prefix_len: 8}
+                      - {address_prefix: 169.254.0.0, prefix_len: 16}
+                      - {address_prefix: 172.16.0.0, prefix_len: 12}
+                      - {address_prefix: 192.0.0.0, prefix_len: 24}
+                      - {address_prefix: 192.0.2.0, prefix_len: 24}
+                      - {address_prefix: 192.88.99.0, prefix_len: 24}
+                      - {address_prefix: 192.168.0.0, prefix_len: 16}
+                      - {address_prefix: 198.18.0.0, prefix_len: 15}
+                      - {address_prefix: 198.51.100.0, prefix_len: 24}
+                      - {address_prefix: 203.0.113.0, prefix_len: 24}
+                      - {address_prefix: 224.0.0.0, prefix_len: 3}
+                      - {address_prefix: '::', prefix_len: 128}
+                      - {address_prefix: '::1', prefix_len: 128}
+                      - {address_prefix: '::ffff:0:0', prefix_len: 96}
+                      - {address_prefix: '64:ff9b::', prefix_len: 96}
+                      - {address_prefix: '64:ff9b:1::', prefix_len: 48}
+                      - {address_prefix: '100::', prefix_len: 64}
+                      - {address_prefix: '2001::', prefix_len: 32}
+                      - {address_prefix: '2001:10::', prefix_len: 28}
+                      - {address_prefix: '2001:20::', prefix_len: 28}
+                      - {address_prefix: '2001:db8::', prefix_len: 32}
+                      - {address_prefix: '2002::', prefix_len: 16}
+                      - {address_prefix: 'fc00::', prefix_len: 7}
+                      - {address_prefix: 'fe80::', prefix_len: 10}
+                      - {address_prefix: 'ff00::', prefix_len: 8}
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -780,6 +812,7 @@ data:
                   dns_cache_config:
                     name: egress_dns_cache
                     dns_lookup_family: ALL
+                    resolved_address_filter: *egress_denied_addresses
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -797,6 +830,7 @@ data:
               dns_cache_config:
                 name: egress_dns_cache
                 dns_lookup_family: ALL
+                resolved_address_filter: *egress_denied_addresses
               # Fallback when envoy.upstream.dynamic_port is absent; the CONNECT
               # leg always sets it.
               port_value: 443
@@ -1026,6 +1060,7 @@ data:
             dns_cache_config:
               name: egress_dns_cache
               dns_lookup_family: ALL
+              resolved_address_filter: *egress_denied_addresses
         # The MITM must not weaken upstream authentication. Envoy decrypted the
         # actor's TLS with a leaf of its own; it still sends the real SNI here
         # and still validates the real origin's certificate against the public
@@ -1073,6 +1108,7 @@ data:
             dns_cache_config:
               name: egress_dns_cache
               dns_lookup_family: ALL
+              resolved_address_filter: *egress_denied_addresses
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
             "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -1116,6 +1152,7 @@ data:
             dns_cache_config:
               name: egress_dns_cache
               dns_lookup_family: ALL
+              resolved_address_filter: *egress_denied_addresses
             # Envoy refuses to build a dynamic forward proxy cluster without
             # auto_sni and auto_san_validation unless this is set, because for
             # the usual TLS case resolving the host from a header and then not
@@ -1152,6 +1189,7 @@ data:
             dns_cache_config:
               name: egress_dns_cache
               dns_lookup_family: ALL
+              resolved_address_filter: *egress_denied_addresses
 
       #ATE_MITM_EXTPROC_CLUSTER -- Don't modify this line.
   # SDS resource for the gateway serving cert. kubelet rotates the projected
