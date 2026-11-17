@@ -792,7 +792,7 @@ func TestEgressManifestsPassthroughChainDialsTheResolvedSNI(t *testing.T) {
 
 // The filter must live in every declaration of the shared cache: Envoy rejects
 // differing configurations, and an unchecked declaration would restore the bypass.
-func TestEgressDNSCacheRejectsNonPublicAnswers(t *testing.T) {
+func TestEgressDNSCacheRejectsLocalAnswers(t *testing.T) {
 	tree := bootstrapTree(t)
 	var caches []node
 	var visit func(any)
@@ -836,9 +836,11 @@ func TestEgressDNSCacheRejectsNonPublicAnswers(t *testing.T) {
 		denied = append(denied, prefix)
 	}
 	for address, blocked := range map[string]bool{
-		"127.0.0.1": true, "10.2.3.4": true, "172.17.0.1": true,
-		"192.168.0.1": true, "169.254.169.254": true, "100.64.0.1": true,
-		"::1": true, "::ffff:127.0.0.1": true, "fc00::1": true, "fe80::1": true,
+		"127.0.0.1": true, "0.0.0.0": true, "169.254.169.254": true,
+		"::1": true, "::ffff:127.0.0.1": true, "fe80::1": true, "fd00:ec2::254": true,
+		// Private ranges hold the deployer's own services.
+		"10.2.3.4": false, "172.17.0.1": false, "192.168.0.1": false,
+		"100.64.0.1": false, "fc00::1": false, "fd12:3456::1": false,
 		"8.8.8.8": false, "2606:4700:4700::1111": false,
 	} {
 		ip := netip.MustParseAddr(address)
