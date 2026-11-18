@@ -289,6 +289,7 @@ func main() {
 		imagecache.WithKeychain(imageCredsKeychain),
 		imagecache.WithLocalhostRegistryReplacement(*localhostRegistryReplacement),
 		imagecache.WithActorsDir(nodepath.ActorsDir),
+		imagecache.WithHostedActors(func() ([]string, error) { return hostedActors(ctx, nodepath.WorkersDir()) }),
 		imagecache.WithMinAge(*imageCacheMinAge),
 		imagecache.WithMeter(otel.Meter("atelet")),
 	)

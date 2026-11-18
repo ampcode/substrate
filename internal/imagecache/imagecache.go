@@ -199,6 +199,11 @@ type Store struct {
 	// the scan (the root set is then empty).
 	actorsDir string
 
+	// hostedActors reports the actors that the workers on this node host. New
+	// asks it before it rebuilds a pool of another layout version. See
+	// WithHostedActors.
+	hostedActors func() ([]string, error)
+
 	// minAge vetoes eviction of any layer or image record younger than this,
 	// covering the window between a pull (or cache-hit stat) and the bundle
 	// spec write / worker mount that roots it.
@@ -273,6 +278,16 @@ func WithActorsDir(dir string) Option {
 	return func(s *Store) { s.actorsDir = dir }
 }
 
+// WithHostedActors gives New the UIDs of the actors that the workers on this
+// node host, or an error when a worker cannot say. An actor's bundle outlives
+// the actor when its worker stops without a checkpoint or terminate, so with
+// this New rebuilds a pool of another layout version, and removes the bundles,
+// when bundles exist and no worker hosts an actor. Without it, any bundle
+// keeps such a pool.
+func WithHostedActors(hostedActors func() ([]string, error)) Option {
+	return func(s *Store) { s.hostedActors = hostedActors }
+}
+
 // WithMinAge overrides the eviction minimum age (default 2m): layers and
 // image records younger than this are never evicted.
 func WithMinAge(d time.Duration) Option {
@@ -340,22 +355,39 @@ func New(root string, opts ...Option) (*Store, error) {
 	case err == nil:
 		if got := strings.TrimSpace(string(b)); got != layoutVersion {
 			// The pool holds no unique state, so rebuild it, but only while no
-			// actor is placed on this node: a running actor's rootfs overlay
-			// reads the layer directories. Bundles exist exactly while an
-			// actor runs or transitions here (see InUse), so any bundle, or
+			// actor runs on this node: a running actor's rootfs overlay reads
+			// the layer directories. A bundle exists while an actor runs or
+			// transitions here (see InUse), and also after its worker stopped
+			// without a checkpoint or terminate. The workers tell the two
+			// apart: a worker reports an actor from the moment it accepts it
+			// until its sandbox is gone. With bundles and no hosted actor, the
+			// bundles are leftovers and go with the pool. A hosted actor, or
 			// not knowing, keeps the pool and fails loudly instead of silently
-			// mixing layouts; an operator then deletes the cache dir.
+			// mixing layouts.
+			mismatch := fmt.Sprintf("image cache at %q has layout version %q and this atelet supports %q", root, got, layoutVersion)
 			placed, err := s.actorsPlaced()
 			if err != nil {
-				return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q: %w", root, got, layoutVersion, err)
+				return nil, fmt.Errorf("%s: %w", mismatch, err)
 			}
 			if placed {
-				return nil, fmt.Errorf("image cache at %q has layout version %q and this atelet supports %q, so delete it once no actor runs on this node", root, got, layoutVersion)
+				if s.hostedActors == nil {
+					return nil, fmt.Errorf("%s, so delete it once no actor runs on this node", mismatch)
+				}
+				hosted, err := s.hostedActors()
+				if err != nil {
+					return nil, fmt.Errorf("%s, and atelet cannot tell whether the actor bundles on this node are in use: %w", mismatch, err)
+				}
+				if len(hosted) > 0 {
+					return nil, fmt.Errorf("%s, and a worker on this node hosts actor %q (actors hosted on the node: %d), so atelet rebuilds it once no worker hosts an actor", mismatch, hosted[0], len(hosted))
+				}
+				if err := s.removeBundles(); err != nil {
+					return nil, fmt.Errorf("while rebuilding image cache at %q from layout version %q: %w", root, got, err)
+				}
 			}
 			if err := s.reset(); err != nil {
 				return nil, fmt.Errorf("while rebuilding image cache at %q from layout version %q: %w", root, got, err)
 			}
-			slog.Warn("Rebuilt the image cache: its layout was from an older atelet and no actor is placed on this node", slog.String("root", root), slog.String("from", got), slog.String("to", layoutVersion))
+			slog.Warn("Rebuilt the image cache: its layout was from an older atelet and no actor runs on this node", slog.String("root", root), slog.String("from", got), slog.String("to", layoutVersion), slog.Bool("removedLeftoverBundles", placed))
 		}
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.WriteFile(versionPath, []byte(layoutVersion+"\n"), 0o600); err != nil {
@@ -429,6 +461,27 @@ func (s *Store) actorsPlaced() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// removeBundles removes every actor's bundles directory. Run and Restore
+// recreate an actor's.
+func (s *Store) removeBundles() error {
+	actorEntries, err := os.ReadDir(s.actorsDir)
+	if err != nil {
+		return fmt.Errorf("while listing actors dir %q: %w", s.actorsDir, err)
+	}
+	for _, actor := range actorEntries {
+		if !actor.IsDir() {
+			continue
+		}
+		// RemoveAllWritable, not os.RemoveAll: a bundle's upper dir can hold
+		// copied-up image directories that keep the image's read-only modes.
+		bundles := filepath.Join(s.actorsDir, actor.Name(), "bundles")
+		if err := RemoveAllWritable(bundles); err != nil {
+			return fmt.Errorf("while removing %s: %w", bundles, err)
+		}
+	}
+	return nil
 }
 
 // reset empties the pool and marks it with the current layout version.

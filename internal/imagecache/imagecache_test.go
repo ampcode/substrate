@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -363,6 +364,81 @@ func TestNew_RebuildsOlderLayoutWithoutActors(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(root, versionFileName)); err != nil || strings.TrimSpace(string(b)) != layoutVersion {
 		t.Errorf("version marker after rebuild = %q, %v; want %q", b, err, layoutVersion)
 	}
+}
+
+// A bundle keeps an older layout only while a worker hosts an actor, or
+// cannot say.
+func TestNew_OlderLayoutWithBundles(t *testing.T) {
+	// plant returns a pool of layout version 1 with one layer, and a bundle.
+	plant := func(t *testing.T) (root, actors, layer, bundle string) {
+		t.Helper()
+		root, actors = t.TempDir(), t.TempDir()
+		layer = filepath.Join(root, "layers", "sha256", "deadbeef", "fs", "bin")
+		bundle = filepath.Join(actors, "actor-1", "bundles", "main")
+		for _, d := range []string{layer, filepath.Join(bundle, "upper", "etc")} {
+			if err := os.MkdirAll(d, 0o700); err != nil {
+				t.Fatalf("planting %s: %v", d, err)
+			}
+		}
+		// A bundle's upper dir keeps the image's modes, which can be read-only.
+		if err := os.Chmod(filepath.Join(bundle, "upper"), 0o500); err != nil {
+			t.Fatalf("making upper dir read-only: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(filepath.Join(bundle, "upper"), 0o700) })
+		if err := os.WriteFile(filepath.Join(root, versionFileName), []byte("1\n"), 0o600); err != nil {
+			t.Fatalf("writing version marker: %v", err)
+		}
+		return root, actors, layer, bundle
+	}
+
+	for _, tc := range []struct {
+		name    string
+		opts    []Option
+		wantErr string
+	}{
+		{"no way to ask the workers", nil, "delete it once no actor runs on this node"},
+		{
+			"a worker hosts an actor",
+			[]Option{WithHostedActors(func() ([]string, error) { return []string{"actor-1"}, nil })},
+			`a worker on this node hosts actor "actor-1"`,
+		},
+		{
+			"a worker cannot say",
+			[]Option{WithHostedActors(func() ([]string, error) { return nil, errors.New("worker did not answer") })},
+			"worker did not answer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, actors, layer, bundle := plant(t)
+			_, err := New(root, append([]Option{WithActorsDir(actors)}, tc.opts...)...)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("New = %v, want an error containing %q", err, tc.wantErr)
+			}
+			for _, kept := range []string{layer, bundle} {
+				if _, err := os.Stat(kept); err != nil {
+					t.Errorf("%s removed although an actor may run: %v", kept, err)
+				}
+			}
+			if b, err := os.ReadFile(filepath.Join(root, versionFileName)); err != nil || strings.TrimSpace(string(b)) != "1" {
+				t.Errorf("version marker = %q, %v; want it left at 1", b, err)
+			}
+		})
+	}
+
+	t.Run("no worker hosts an actor", func(t *testing.T) {
+		root, actors, layer, bundle := plant(t)
+		if _, err := New(root, WithActorsDir(actors), WithHostedActors(func() ([]string, error) { return nil, nil })); err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		for _, removed := range []string{layer, filepath.Dir(bundle)} {
+			if _, err := os.Stat(removed); !os.IsNotExist(err) {
+				t.Errorf("%s survived the rebuild: %v", removed, err)
+			}
+		}
+		if b, err := os.ReadFile(filepath.Join(root, versionFileName)); err != nil || strings.TrimSpace(string(b)) != layoutVersion {
+			t.Errorf("version marker after rebuild = %q, %v; want %q", b, err, layoutVersion)
+		}
+	})
 }
 
 func TestIsLocalRegistry(t *testing.T) {

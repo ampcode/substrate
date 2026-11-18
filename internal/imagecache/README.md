@@ -127,9 +127,14 @@ layer diffIDs in order — layers shared by N images exist once.
 
    A layer already in the pool is reused without re-hashing, because it
    was checked when it was written. The reusing image's own blob is never
-   downloaded, so it is never checked. atelet refuses a layout version 1
-   pool, whose layers may not have been checked, and a version 2 pool,
-   whose layers are root-owned without setuid, setgid or sticky bits.
+   downloaded, so it is never checked. atelet does not reuse a layout
+   version 1 pool, whose layers may not have been checked, or a version 2
+   pool, whose layers are root-owned without setuid, setgid or sticky bits.
+   `New` rebuilds such a pool. An actor's bundle stays on the node when
+   its worker stops without a checkpoint or terminate, so `New` asks the
+   node's workers which actors they host. When none hosts an actor, it
+   removes the bundles with the pool. When a worker hosts an actor, or
+   does not answer, atelet refuses to start until none does.
 6. **Record**: the image config + diffID list is written under the
    requested digest (and the per-platform child digest for multi-arch refs).
 

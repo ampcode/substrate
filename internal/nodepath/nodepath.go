@@ -97,10 +97,14 @@ func WorkerPath(podUID string) string {
 	return filepath.Join(WorkersDir(), podUID)
 }
 
+// WorkerSocketName is the base name of the socket in WorkerPath(podUID) that
+// a worker serves its RPCs on.
+const WorkerSocketName = "worker.sock"
+
 func WorkerSocketPath(podUID string) string {
 	return filepath.Join(
 		WorkerPath(podUID),
-		"worker.sock",
+		WorkerSocketName,
 	)
 }
 
