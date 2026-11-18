@@ -726,8 +726,9 @@ patches:
           restartPolicy: Always
           image: ko://go.ate.dev/substrate/cmd/podcert-agent
           args:
-          # root:postgres 0640 via the pod's fsGroup, the only shared mode
-          # PostgreSQL accepts for ssl_key_file.
+          # root:postgres 0640, the only shared mode PostgreSQL accepts for
+          # ssl_key_file. The securityContext below sets the owner and group,
+          # because the image's user is not root.
           - --file-mode=0640
           - --cert=servicedns.podcert.ate.dev/identity=/out/servicedns
           - --trust=postgres.podcert.ate.dev/identity=/out/postgres-ca
@@ -752,6 +753,8 @@ patches:
           - name: postgres-ca
             mountPath: /out/postgres-ca
           securityContext:
+            runAsUser: 0
+            runAsGroup: 70
             allowPrivilegeEscalation: false
             capabilities:
               drop:
